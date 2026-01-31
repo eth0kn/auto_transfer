@@ -1,13 +1,14 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http'); // Perlu module http native
-const { Server } = require('socket.io'); // Import Socket.IO
+const http = require('http');
+const { Server } = require('socket.io');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
+const crypto = require('crypto'); // Built-in node module
 
 const app = express();
-const server = http.createServer(app); // Bungkus express app dengan http server
-const io = new Server(server); // Init Socket.IO
+const server = http.createServer(app);
+const io = new Server(server);
 
 const PORT = process.env.PORT || 3002;
 
@@ -15,7 +16,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- KONFIGURASI DATABASE ---
 const dbConfig = {
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
@@ -28,8 +28,15 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 
+// --- HELPER: ID GENERATOR ---
+// Menghasilkan ID unik: TRX-XXXX-XXXX (Contoh: TRX-A1B2-C3D4)
+function generateTrxId() {
+    const random = crypto.randomBytes(4).toString('hex').toUpperCase(); // 8 karakter hex
+    return `TRX-${random}`;
+}
+
 // ==========================================
-// A. ENDPOINT UTAMA (LOGIC BOT)
+// A. ENDPOINT LOGIC
 // ==========================================
 
 // 1. ADMIN: Buat Request Transfer
@@ -39,9 +46,14 @@ app.post('/transfer', async (req, res) => {
         if (!alias || !dest || !amount || !pin) {
             return res.status(400).json({ success: false, msg: "Data wajib diisi" });
         }
-        const sql = `INSERT INTO transfer_request (bot_alias, bank_type, dest, amount, pin, status) VALUES (?, ?, ?, ?, ?, 'PENDING')`;
-        const [result] = await pool.execute(sql, [alias, bank || 'BRI', dest, amount, pin]);
-        res.json({ success: true, msg: "Request masuk antrian", task_id: result.insertId });
+
+        // GENERATE ID DI SINI
+        const newTaskId = generateTrxId();
+
+        const sql = `INSERT INTO transfer_request (id, bot_alias, bank_type, dest, amount, pin, status) VALUES (?, ?, ?, ?, ?, ?, 'PENDING')`;
+        await pool.execute(sql, [newTaskId, alias, bank || 'BRI', dest, amount, pin]);
+
+        res.json({ success: true, msg: "Request masuk antrian", task_id: newTaskId });
     } catch (err) {
         res.status(500).json({ success: false, msg: err.message });
     }
@@ -65,15 +77,18 @@ app.post('/get-task', async (req, res) => {
             return res.json({ task_available: false });
         }
         const task = rows[0];
+
+        // Update status jadi PROCESSING
         await connection.execute(
             `UPDATE transfer_request SET status = 'PROCESSING', updated_at = NOW() WHERE id = ?`,
             [task.id]
         );
         await connection.commit();
+
         console.log(`[DISPATCH] Task ${task.id} -> Bot ${alias}`);
         res.json({
             task_available: true,
-            task_id: task.id,
+            task_id: task.id, // String ID
             bank_type: task.bank_type,
             destination: task.dest,
             amount: parseFloat(task.amount),
@@ -106,7 +121,7 @@ app.post('/update-task', async (req, res) => {
             [status, finalMessage, refNumber, task_id]
         );
 
-        // Notify Dashboard: Task Completed
+        // Notify Dashboard (WebSocket)
         io.emit('task_completed', { task_id, status });
 
         console.log(`[REPORT] Task ${task_id} -> ${status}`);
@@ -116,14 +131,11 @@ app.post('/update-task', async (req, res) => {
     }
 });
 
-// ==========================================
-// B. ENDPOINT VALIDASI (REALTIME)
-// ==========================================
-
-// 4. BOT: Kirim Data Konfirmasi Layar
+// 4. BOT: Kirim Data Konfirmasi (REALTIME VALIDATION)
 app.post('/validate-confirmation', async (req, res) => {
     try {
         const d = req.body;
+        // Insert/Update tabel validation menggunakan ID String
         await pool.execute(
             `INSERT INTO transfer_validations 
             (task_id, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status) 
@@ -133,17 +145,16 @@ app.post('/validate-confirmation', async (req, res) => {
             [d.task_id, d.device_id, d.account_name, d.account_name_extracted, d.account_number_extracted, d.bank_name, d.total_amount, d.account_name_extracted, d.account_number_extracted]
         );
 
-        // Ambil data request asli untuk ditampilkan side-by-side
+        // Ambil data asli untuk komparasi UI
         const [reqData] = await pool.execute('SELECT amount, dest FROM transfer_request WHERE id = ?', [d.task_id]);
 
-        // WEBSOCKET: Kirim notifikasi ke dashboard ada data baru
-        const payload = {
+        // Broadcast ke Dashboard
+        io.emit('new_validation', {
             ...d,
             original_amount: reqData[0]?.amount || 0,
             original_dest: reqData[0]?.dest || '-',
             created_at: new Date()
-        };
-        io.emit('new_validation', payload);
+        });
 
         res.json({ success: true });
     } catch (e) {
@@ -152,59 +163,44 @@ app.post('/validate-confirmation', async (req, res) => {
     }
 });
 
-// 5. BOT: Polling Keputusan Admin
+// 5. Polling & Decision
 app.get('/get-validation-decision/:task_id', async (req, res) => {
     try {
         const [rows] = await pool.execute('SELECT status FROM transfer_validations WHERE task_id = ?', [req.params.task_id]);
         const status = rows.length > 0 ? rows[0].status : 'WAITING';
         res.json({ action: status === 'WAITING' ? 'WAIT' : status });
-    } catch (e) {
-        res.json({ action: 'WAIT' });
-    }
+    } catch (e) { res.json({ action: 'WAIT' }); }
 });
 
-// 6. ADMIN: Update Keputusan
 app.post('/update-decision', async (req, res) => {
     try {
         const { task_id, status } = req.body;
         await pool.execute('UPDATE transfer_validations SET status = ? WHERE task_id = ?', [status, task_id]);
-
         if (status === 'ABORT') {
             await pool.execute('UPDATE transfer_request SET status = "FAILED", message = "Rejected by Admin" WHERE id = ?', [task_id]);
         }
-
-        // WEBSOCKET: Beritahu dashboard bahwa status berubah (hilangkan dari list)
         io.emit('decision_updated', { task_id, status });
-
         res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ==========================================
-// C. FRONTEND API & DASHBOARD
-// ==========================================
-
-// API: Ambil History Transaksi
+// 6. API History & Data
 app.get('/api/history', async (req, res) => {
     try {
-        // Ambil 50 transaksi terakhir yang sudah selesai
+        // Query History (7 Hari Terakhir)
         const [rows] = await pool.execute(`
             SELECT r.id, r.bot_alias, r.dest, r.amount, r.status, r.ref_number, r.updated_at,
                    v.target_name_extracted, v.bank_name
             FROM transfer_request r
             LEFT JOIN transfer_validations v ON r.id = v.task_id
-            WHERE r.status IN ('SUCCESS', 'FAILED') AND r.updated_at >= (NOW() - INTERVAL 7 DAY)
-            ORDER BY r.updated_at DESC LIMIT 50
+            WHERE r.status IN ('SUCCESS', 'FAILED')
+            AND r.updated_at >= (NOW() - INTERVAL 7 DAY)
+            ORDER BY r.updated_at DESC
         `);
         res.json(rows);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// API: Ambil Data Dashboard Awal (Saat refresh page)
 app.get('/api/pending-validations', async (req, res) => {
     try {
         const [rows] = await pool.execute(`
@@ -215,33 +211,26 @@ app.get('/api/pending-validations', async (req, res) => {
             ORDER BY v.created_at DESC
         `);
         res.json(rows);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// SERVE HTML DASHBOARD
-app.get(['/', '/dashboard', '/history'], (req, res) => {
-    res.send(getHtmlUI());
-});
+// Serve HTML
+app.get(['/', '/dashboard', '/history'], (req, res) => res.send(getHtmlUI()));
 
-// --- SYSTEM: Auto-Reset Stuck Jobs ---
+// Cleanup
 setInterval(async () => {
     try {
         const sql = `UPDATE transfer_request SET status = 'PENDING', message = 'Auto-reset: Timeout' 
                      WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 10 MINUTE)`;
         await pool.execute(sql);
-    } catch (err) { console.error("Cleanup Error:", err); }
+    } catch (err) { }
 }, 60000);
 
-// Gunakan server.listen (bukan app.listen) untuk Socket.IO
 server.listen(PORT, () => {
-    console.log(`🚀 Server + WebSocket running on Port ${PORT}`);
+    console.log(`🚀 Server (TRX-ID) running on Port ${PORT}`);
 });
 
-// ==========================================
-// D. FRONTEND TEMPLATE (HTML/CSS/JS)
-// ==========================================
+// --- D. FRONTEND TEMPLATE ---
 function getHtmlUI() {
     return `
 <!DOCTYPE html>
@@ -249,45 +238,40 @@ function getHtmlUI() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Transfer Command Center</title>
+    <title>BotCommander 2.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #e2e8f0; }
-        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
-        .btn-action { transition: all 0.2s; }
-        .btn-action:active { transform: scale(0.95); }
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #0f172a; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.05); }
+        /* Animasi masuk */
+        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-slide-in { animation: slideIn 0.3s ease-out forwards; }
     </style>
     <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: { extend: { colors: { primary: '#3b82f6', success: '#10b981', danger: '#ef4444', warning: '#f59e0b' } } }
-        }
+        tailwind.config = { darkMode: 'class', theme: { extend: { colors: { primary: '#3b82f6' } } } }
     </script>
 </head>
-<body class="min-h-screen flex flex-col">
+<body class="min-h-screen flex flex-col bg-[url('https://tailwindcss.com/_next/static/media/hero-dark.9a752424.jpg')] bg-cover bg-fixed">
 
-    <nav class="border-b border-slate-800 bg-slate-900/80 sticky top-0 z-50 backdrop-blur-md">
+    <nav class="border-b border-white/10 bg-slate-900/80 sticky top-0 z-50 backdrop-blur-md">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex items-center justify-between h-16">
-                <div class="flex items-center gap-2">
-                    <div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center font-bold text-white">B</div>
-                    <span class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-400">BotCommander</span>
+                <div class="flex items-center gap-3">
+                    <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/30">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                    </div>
+                    <span class="text-xl font-bold tracking-tight text-white">Bot<span class="text-blue-400">Commander</span></span>
                 </div>
-                <div class="flex space-x-4">
-                    <button onclick="switchTab('dashboard')" id="nav-dashboard" class="px-3 py-2 rounded-md text-sm font-medium text-white bg-slate-800 hover:bg-slate-700 transition">Live Validations</button>
-                    <button onclick="switchTab('history')" id="nav-history" class="px-3 py-2 rounded-md text-sm font-medium text-slate-400 hover:text-white hover:bg-slate-800 transition">History</button>
+                <div class="flex bg-slate-800/50 p-1 rounded-lg border border-white/5">
+                    <button onclick="switchTab('dashboard')" id="nav-dashboard" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all">Live</button>
+                    <button onclick="switchTab('history')" id="nav-history" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all text-slate-400 hover:text-white">History</button>
                 </div>
                 <div class="flex items-center gap-2">
-                    <div id="connection-status" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
-                    <span class="text-xs text-slate-500 font-mono">SOCKET</span>
+                    <span id="socket-status" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
                 </div>
             </div>
         </div>
@@ -295,82 +279,72 @@ function getHtmlUI() {
 
     <main class="flex-grow p-6 max-w-7xl mx-auto w-full">
         
-        <div id="view-dashboard" class="space-y-6 animate-fade-in">
-            <div class="flex justify-between items-end">
+        <div id="view-dashboard" class="space-y-6">
+            <div class="flex justify-between items-end mb-6">
                 <div>
-                    <h2 class="text-2xl font-semibold text-white">Menunggu Persetujuan</h2>
-                    <p class="text-slate-400 text-sm mt-1">Transaksi yang membutuhkan validasi manual dari Bot.</p>
-                </div>
-                <div class="bg-blue-900/30 border border-blue-800 rounded px-3 py-1">
-                    <span class="text-xs text-blue-400 font-mono">REALTIME MODE</span>
+                    <h2 class="text-3xl font-bold text-white tracking-tight">Validation Queue</h2>
+                    <p class="text-slate-400 mt-1">Realtime monitoring & approval system.</p>
                 </div>
             </div>
 
-            <div class="glass-panel rounded-xl overflow-hidden shadow-2xl">
+            <div class="glass-panel rounded-2xl overflow-hidden shadow-2xl">
                 <table class="w-full text-left">
-                    <thead class="bg-slate-800/50 text-slate-400 uppercase text-xs font-semibold tracking-wider">
+                    <thead class="bg-slate-900/50 text-slate-400 uppercase text-xs font-bold tracking-wider">
                         <tr>
-                            <th class="p-4">Task ID / Device</th>
-                            <th class="p-4">Validasi Data (Layar vs Request)</th>
-                            <th class="p-4 text-right">Nominal</th>
-                            <th class="p-4 text-center">Aksi</th>
+                            <th class="p-5">Transaction ID</th>
+                            <th class="p-5">Validation Details</th>
+                            <th class="p-5 text-right">Amount</th>
+                            <th class="p-5 text-center">Decision</th>
                         </tr>
                     </thead>
-                    <tbody id="validation-list" class="divide-y divide-slate-800 text-sm">
+                    <tbody id="validation-list" class="divide-y divide-white/5 text-sm">
                         </tbody>
                 </table>
-                <div id="empty-state" class="p-12 text-center hidden">
-                    <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-slate-800 mb-4">
-                        <svg class="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                <div id="empty-state" class="p-16 text-center hidden">
+                    <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-slate-800/50 mb-4 ring-1 ring-white/10">
+                        <svg class="w-10 h-10 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                     </div>
-                    <h3 class="text-lg font-medium text-white">Semua Bersih</h3>
-                    <p class="text-slate-500">Tidak ada antrian validasi saat ini.</p>
+                    <h3 class="text-xl font-medium text-white">All Caught Up!</h3>
+                    <p class="text-slate-500 mt-2">No pending validations at the moment.</p>
                 </div>
             </div>
         </div>
 
-        <div id="view-history" class="space-y-6 hidden animate-fade-in">
-            <div class="flex justify-between items-center">
+        <div id="view-history" class="hidden space-y-6">
+            <div class="flex justify-between items-center mb-6">
                 <div>
-                    <h2 class="text-2xl font-semibold text-white">Riwayat Transaksi</h2>
-                    <p class="text-slate-400 text-sm mt-1">50 Transaksi terakhir yang telah selesai.</p>
+                    <h2 class="text-3xl font-bold text-white tracking-tight">Transaction History</h2>
+                    <p class="text-slate-400 mt-1">Showing data from the last 7 days.</p>
                 </div>
-                <button onclick="loadHistory()" class="text-sm text-blue-400 hover:text-blue-300 flex items-center gap-1">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                    Refresh
+                <button onclick="loadHistory()" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 transition">
+                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                 </button>
             </div>
-
-            <div class="glass-panel rounded-xl overflow-hidden shadow-lg">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left">
-                        <thead class="bg-slate-800/50 text-slate-400 uppercase text-xs font-semibold tracking-wider">
-                            <tr>
-                                <th class="p-4">Waktu</th>
-                                <th class="p-4">ID & Bot</th>
-                                <th class="p-4">Tujuan</th>
-                                <th class="p-4">Ref No</th>
-                                <th class="p-4 text-right">Nominal</th>
-                                <th class="p-4 text-center">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="history-list" class="divide-y divide-slate-800 text-sm">
-                            </tbody>
-                    </table>
-                </div>
+            <div class="glass-panel rounded-2xl overflow-hidden shadow-xl">
+                <table class="w-full text-left">
+                    <thead class="bg-slate-900/50 text-slate-400 uppercase text-xs font-bold tracking-wider">
+                        <tr>
+                            <th class="p-5">Time</th>
+                            <th class="p-5">ID & Alias</th>
+                            <th class="p-5">Target</th>
+                            <th class="p-5 text-right">Total</th>
+                            <th class="p-5 text-center">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-list" class="divide-y divide-white/5 text-sm text-slate-300"></tbody>
+                </table>
             </div>
         </div>
-
     </main>
 
-    <div id="toast" class="fixed bottom-5 right-5 transform translate-y-20 opacity-0 transition-all duration-300 z-50">
-        <div class="bg-slate-800 border border-slate-700 shadow-xl rounded-lg p-4 flex items-center gap-3">
-            <div class="text-green-400">
+    <div id="toast" class="fixed bottom-6 right-6 transform translate-y-24 opacity-0 transition-all duration-500 z-50">
+        <div class="glass-panel p-4 rounded-xl shadow-2xl border-l-4 border-blue-500 flex items-center gap-4 min-w-[300px]">
+            <div class="bg-blue-500/20 p-2 rounded-lg text-blue-400">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path></svg>
             </div>
             <div>
-                <h4 class="font-bold text-white text-sm">Validasi Baru!</h4>
-                <p class="text-slate-400 text-xs" id="toast-msg">Task ID #123 masuk antrian.</p>
+                <h4 class="font-bold text-white">New Request!</h4>
+                <p class="text-xs text-slate-400 font-mono mt-1" id="toast-msg">TRX-...</p>
             </div>
         </div>
     </div>
@@ -378,49 +352,84 @@ function getHtmlUI() {
     <script>
         const socket = io();
         
-        // --- SOCKET EVENTS ---
         socket.on('connect', () => {
-            document.getElementById('connection-status').classList.remove('bg-red-500');
-            document.getElementById('connection-status').classList.add('bg-green-500');
+            document.getElementById('socket-status').classList.replace('bg-red-500', 'bg-green-500');
         });
-
+        
         socket.on('disconnect', () => {
-            document.getElementById('connection-status').classList.remove('bg-green-500');
-            document.getElementById('connection-status').classList.add('bg-red-500');
+            document.getElementById('socket-status').classList.replace('bg-green-500', 'bg-red-500');
         });
 
         socket.on('new_validation', (data) => {
             addValidationRow(data);
-            showToast(\`Task #\${data.task_id} Butuh validasi\`);
-            playNotificationSound();
+            showToast(data.task_id);
         });
 
         socket.on('decision_updated', (data) => {
-            removeValidationRow(data.task_id);
-        });
-
-        socket.on('task_completed', (data) => {
-            // Optional: Refresh history if open
-            if(!document.getElementById('view-history').classList.contains('hidden')) {
-                loadHistory();
+            const row = document.getElementById('row-' + data.task_id);
+            if(row) {
+                row.classList.add('opacity-0', '-translate-x-10');
+                setTimeout(() => { row.remove(); checkEmpty(); }, 300);
             }
         });
 
-        // --- CORE FUNCTIONS ---
-
-        function formatRupiah(amount) {
-            return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(amount);
+        function formatRupiah(num) {
+            return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(num);
         }
 
-        async function initDashboard() {
+        function checkEmpty() {
+            const isEmpty = document.getElementById('validation-list').children.length === 0;
+            document.getElementById('empty-state').classList.toggle('hidden', !isEmpty);
+        }
+
+        async function init() {
             const res = await fetch('/api/pending-validations');
             const data = await res.json();
             document.getElementById('validation-list').innerHTML = '';
-            if(data.length === 0) toggleEmptyState(true);
-            else {
-                toggleEmptyState(false);
-                data.forEach(addValidationRow);
-            }
+            if(data.length) data.forEach(addValidationRow);
+            checkEmpty();
+        }
+
+        function addValidationRow(d) {
+            checkEmpty();
+            if(document.getElementById('row-' + d.task_id)) return;
+
+            const tr = document.createElement('tr');
+            tr.id = 'row-' + d.task_id;
+            tr.className = 'animate-slide-in hover:bg-white/5 transition duration-200';
+            
+            const isMatch = d.total_amount == d.original_amount;
+            const amountClass = isMatch ? 'text-green-400' : 'text-amber-400';
+            const amountNote = isMatch ? '' : '<div class="text-[10px] text-amber-500 mt-1">Mismatch Warning</div>';
+
+            tr.innerHTML = \`
+                <td class="p-5 align-top">
+                    <div class="font-mono text-sm font-bold text-blue-400">\${d.task_id}</div>
+                    <div class="text-xs text-slate-500 mt-1">\${moment(d.created_at).format('HH:mm:ss')}</div>
+                    <div class="text-xs text-slate-600 mt-1">\${d.device_id}</div>
+                </td>
+                <td class="p-5 align-top">
+                    <div class="flex flex-col gap-1">
+                        <span class="text-white font-semibold">\${d.target_name_extracted}</span>
+                        <div class="flex items-center gap-2 text-xs">
+                            <span class="bg-blue-500/10 text-blue-400 px-2 py-0.5 rounded border border-blue-500/20">\${d.bank_name}</span>
+                            <span class="font-mono text-slate-400">\${d.target_rek_extracted}</span>
+                        </div>
+                    </div>
+                </td>
+                <td class="p-5 align-top text-right">
+                    <div class="text-lg font-bold \${amountClass}">\${formatRupiah(d.total_amount)}</div>
+                    \${amountNote}
+                </td>
+                <td class="p-5 align-top text-center">
+                    <div class="flex gap-2 justify-center">
+                        <button onclick="decide('\${d.task_id}', 'PROCEED')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded-lg shadow-lg shadow-green-500/20 text-xs font-bold tracking-wide transition transform hover:scale-105">ACCEPT</button>
+                        <button onclick="decide('\${d.task_id}', 'ABORT')" class="bg-slate-700 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg border border-white/10 text-xs font-bold tracking-wide transition transform hover:scale-105">REJECT</button>
+                    </div>
+                </td>
+            \`;
+            document.getElementById('validation-list').prepend(tr);
+            checkEmpty();
         }
 
         async function loadHistory() {
@@ -429,168 +438,67 @@ function getHtmlUI() {
             const tbody = document.getElementById('history-list');
             tbody.innerHTML = '';
             
-            data.forEach(row => {
-                const statusColor = row.status === 'SUCCESS' ? 'text-green-400 bg-green-900/20 border-green-800' : 'text-red-400 bg-red-900/20 border-red-800';
-                
+            data.forEach(r => {
+                const statusBadge = r.status === 'SUCCESS' 
+                    ? '<span class="px-2 py-1 bg-green-500/10 text-green-400 border border-green-500/20 rounded text-xs font-bold">SUCCESS</span>' 
+                    : '<span class="px-2 py-1 bg-red-500/10 text-red-400 border border-red-500/20 rounded text-xs font-bold">FAILED</span>';
+
                 const tr = document.createElement('tr');
-                tr.className = 'hover:bg-slate-800/50 transition';
+                tr.className = 'hover:bg-white/5 transition';
                 tr.innerHTML = \`
-                    <td class="p-4 text-slate-400 whitespace-nowrap">\${moment(row.updated_at).format('DD MMM HH:mm')}</td>
-                    <td class="p-4">
-                        <div class="font-bold text-white">\${row.id}</div>
-                        <div class="text-xs text-blue-400">\${row.bot_alias || 'General'}</div>
+                    <td class="p-5 text-slate-400 text-xs whitespace-nowrap">\${moment(r.updated_at).format('DD MMM HH:mm')}</td>
+                    <td class="p-5">
+                        <div class="font-mono text-xs text-blue-300">\${r.id}</div>
+                        <div class="text-[10px] text-slate-500 mt-0.5">\${r.bot_alias}</div>
                     </td>
-                    <td class="p-4">
-                        <div class="text-slate-200">\${row.target_name_extracted || '-'}</div>
-                        <div class="text-xs text-slate-500">\${row.dest}</div>
+                    <td class="p-5">
+                        <div class="text-sm text-white">\${r.target_name_extracted || r.dest}</div>
+                        <div class="font-mono text-[10px] text-slate-500">\${r.bank_name || '-'} | Ref: \${r.ref_number || '-'}</div>
                     </td>
-                    <td class="p-4 font-mono text-slate-300 text-xs">\${row.ref_number || '-'}</td>
-                    <td class="p-4 text-right font-bold text-slate-200">\${formatRupiah(row.amount)}</td>
-                    <td class="p-4 text-center">
-                        <span class="px-2 py-1 rounded text-xs font-bold border \${statusColor}">\${row.status}</span>
-                    </td>
+                    <td class="p-5 text-right font-mono text-sm">\${formatRupiah(r.amount)}</td>
+                    <td class="p-5 text-center">\${statusBadge}</td>
                 \`;
                 tbody.appendChild(tr);
             });
         }
 
-        function addValidationRow(data) {
-            toggleEmptyState(false);
-            const tbody = document.getElementById('validation-list');
-            
-            // Check duplicat
-            if(document.getElementById(\`task-\${data.task_id}\`)) return;
-
-            const tr = document.createElement('tr');
-            tr.id = \`task-\${data.task_id}\`;
-            tr.className = 'animate-pulse-once bg-slate-800/30 border-b border-slate-700 hover:bg-slate-700/30 transition';
-            
-            // Highlight jika nominal beda
-            const amountWarning = data.total_amount != data.original_amount 
-                ? '<span class="text-xs text-red-400 block mt-1">⚠ Beda dengan Request</span>' 
-                : '';
-
-            tr.innerHTML = \`
-                <td class="p-4">
-                    <div class="font-bold text-lg text-blue-400">#\${data.task_id}</div>
-                    <div class="text-xs text-slate-500">\${data.device_id}</div>
-                    <div class="text-xs text-slate-400 italic">\${data.account_name}</div>
-                </td>
-                <td class="p-4">
-                    <div class="bg-slate-900/50 p-3 rounded border border-slate-700">
-                        <div class="flex justify-between mb-1">
-                            <span class="text-xs text-slate-500 uppercase">Layar HP:</span>
-                            <span class="text-xs text-slate-500 uppercase">Request API:</span>
-                        </div>
-                        <div class="flex justify-between items-center gap-4">
-                            <div>
-                                <div class="font-bold text-white">\${data.target_name_extracted}</div>
-                                <div class="text-xs text-blue-300">\${data.bank_name} - \${data.target_rek_extracted}</div>
-                            </div>
-                            <div class="text-right">
-                                <div class="font-mono text-slate-300">\${data.original_dest}</div>
-                            </div>
-                        </div>
-                    </div>
-                </td>
-                <td class="p-4 text-right">
-                    <div class="font-bold text-xl text-green-400">\${formatRupiah(data.total_amount)}</div>
-                    <div class="text-xs text-slate-500">Req: \${formatRupiah(data.original_amount)}</div>
-                    \${amountWarning}
-                </td>
-                <td class="p-4 text-center">
-                    <div class="flex gap-2 justify-center">
-                        <button onclick="sendDecision('\${data.task_id}', 'PROCEED')" class="btn-action bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded shadow-lg shadow-green-900/20 font-bold flex items-center gap-1">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-                            APPROVE
-                        </button>
-                        <button onclick="sendDecision('\${data.task_id}', 'ABORT')" class="btn-action bg-slate-700 hover:bg-red-600 text-white px-4 py-2 rounded shadow font-bold flex items-center gap-1 group">
-                            <svg class="w-4 h-4 group-hover:rotate-90 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                            REJECT
-                        </button>
-                    </div>
-                </td>
-            \`;
-            
-            tbody.prepend(tr);
-        }
-
-        function removeValidationRow(taskId) {
-            const row = document.getElementById(\`task-\${taskId}\`);
-            if (row) {
-                row.style.opacity = '0';
-                setTimeout(() => {
-                    row.remove();
-                    if(document.getElementById('validation-list').children.length === 0) toggleEmptyState(true);
-                }, 300);
-            }
-        }
-
-        function sendDecision(id, action) {
-            if(!confirm(\`Konfirmasi \${action} untuk Task #\${id}?\`)) return;
-            
-            // UI Feedback Immediate
-            const row = document.getElementById(\`task-\${id}\`);
-            if(row) row.classList.add('opacity-50', 'pointer-events-none');
-
+        function decide(id, action) {
+            if(!confirm('Confirm action?')) return;
             fetch('/update-decision', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ task_id: id, status: action })
-            }).catch(e => {
-                alert('Gagal mengirim keputusan');
-                if(row) row.classList.remove('opacity-50', 'pointer-events-none');
             });
         }
 
-        // --- UI UTILS ---
         function switchTab(tab) {
-            const dashView = document.getElementById('view-dashboard');
-            const histView = document.getElementById('view-history');
-            const navDash = document.getElementById('nav-dashboard');
-            const navHist = document.getElementById('nav-history');
+            const dash = document.getElementById('view-dashboard');
+            const hist = document.getElementById('view-history');
+            const btnDash = document.getElementById('nav-dashboard');
+            const btnHist = document.getElementById('nav-history');
 
-            if (tab === 'dashboard') {
-                dashView.classList.remove('hidden');
-                histView.classList.add('hidden');
-                navDash.classList.add('bg-slate-800', 'text-white');
-                navDash.classList.remove('text-slate-400');
-                navHist.classList.remove('bg-slate-800', 'text-white');
-                navHist.classList.add('text-slate-400');
-                initDashboard();
+            if(tab === 'dashboard') {
+                dash.classList.remove('hidden'); hist.classList.add('hidden');
+                btnDash.className = "px-4 py-1.5 rounded-md text-sm font-medium transition-all bg-blue-600 text-white shadow-lg shadow-blue-500/30";
+                btnHist.className = "px-4 py-1.5 rounded-md text-sm font-medium transition-all text-slate-400 hover:text-white";
+                init();
             } else {
-                dashView.classList.add('hidden');
-                histView.classList.remove('hidden');
-                navHist.classList.add('bg-slate-800', 'text-white');
-                navHist.classList.remove('text-slate-400');
-                navDash.classList.remove('bg-slate-800', 'text-white');
-                navDash.classList.add('text-slate-400');
+                dash.classList.add('hidden'); hist.classList.remove('hidden');
+                btnHist.className = "px-4 py-1.5 rounded-md text-sm font-medium transition-all bg-blue-600 text-white shadow-lg shadow-blue-500/30";
+                btnDash.className = "px-4 py-1.5 rounded-md text-sm font-medium transition-all text-slate-400 hover:text-white";
                 loadHistory();
             }
         }
 
-        function toggleEmptyState(show) {
-            const el = document.getElementById('empty-state');
-            if(show) el.classList.remove('hidden');
-            else el.classList.add('hidden');
+        function showToast(id) {
+            const t = document.getElementById('toast');
+            document.getElementById('toast-msg').innerText = id;
+            t.classList.remove('translate-y-24', 'opacity-0');
+            setTimeout(() => t.classList.add('translate-y-24', 'opacity-0'), 4000);
         }
 
-        function showToast(msg) {
-            const toast = document.getElementById('toast');
-            document.getElementById('toast-msg').innerText = msg;
-            toast.classList.remove('translate-y-20', 'opacity-0');
-            setTimeout(() => {
-                toast.classList.add('translate-y-20', 'opacity-0');
-            }, 3000);
-        }
-
-        function playNotificationSound() {
-            // Simple beep logic if needed, or leave blank to avoid browser blocking
-        }
-
-        // Init
-        initDashboard();
-
+        // Boot
+        switchTab('dashboard');
     </script>
 </body>
 </html>
