@@ -243,6 +243,21 @@ app.get('/api/pending-validations', requireAuth, async (req, res) => {
 // Serve HTML
 app.get(['/', '/dashboard', '/history'], requireAuth, (req, res) => res.send(getHtmlUI()));
 
+app.get('/logout', (req, res) => {
+    // Mengirim kembali header auth agar browser meminta input baru
+    res.set('WWW-Authenticate', 'Basic realm="401"');
+    res.status(401).send(`
+        <!DOCTYPE html>
+        <html>
+        <body style="background:#0f172a; color:#e2e8f0; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
+            <h2 style="color:#ef4444;">Logged Out</h2>
+            <p>Sesi Anda telah dihentikan.</p>
+            <a href="/dashboard" style="color:#3b82f6; text-decoration:none; border:1px solid #3b82f6; padding:8px 16px; border-radius:8px;">Login Kembali</a>
+        </body>
+        </html>
+    `);
+});
+
 // Cleanup
 setInterval(async () => {
     try {
@@ -295,6 +310,11 @@ function getHtmlUI() {
                 <div class="flex bg-slate-800/50 p-1 rounded-lg border border-white/5">
                     <button onclick="switchTab('dashboard')" id="nav-dashboard" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all">Live</button>
                     <button onclick="switchTab('history')" id="nav-history" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all text-slate-400 hover:text-white">History</button>
+                    <button onclick="handleLogout()" class="p-2 text-slate-400 hover:text-red-400 transition" title="Logout">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                        </svg>
+                    </button>
                 </div>
                 <div class="flex items-center gap-2">
                     <span id="socket-status" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
@@ -398,6 +418,13 @@ function getHtmlUI() {
                 setTimeout(() => { row.remove(); checkEmpty(); }, 300);
             }
         });
+
+        function handleLogout() {
+            if(confirm('Apakah Anda yakin ingin logout?')) {
+                // Redirect ke endpoint logout
+                window.location.href = '/logout';
+            }
+        }
 
         function formatRupiah(num) {
             return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(num);
