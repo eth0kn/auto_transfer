@@ -35,12 +35,34 @@ function generateTrxId() {
     return `TRX-${random}`;
 }
 
+const requireAuth = (req, res, next) => {
+    const auth = { login: process.env.DASHBOARD_USER || 'admin', password: process.env.DASHBOARD_PASS || 'admin123' };
+    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
+    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
+
+    if (login && password && login === auth.login && password === auth.password) {
+        return next();
+    }
+
+    res.set('WWW-Authenticate', 'Basic realm="401"'); // Memicu popup browser
+    res.status(401).send('Akses ditolak: Password diperlukan.');
+};
+
+// 2. Cek API Key (Untuk Inject Tugas)
+const requireApiKey = (req, res, next) => {
+    const key = req.headers['x-api-key'];
+    if (!key || key !== process.env.API_KEY) {
+        return res.status(401).json({ success: false, msg: "Invalid or Missing X-API-KEY" });
+    }
+    next();
+};
+
 // ==========================================
 // A. ENDPOINT LOGIC
 // ==========================================
 
 // 1. ADMIN: Buat Request Transfer
-app.post('/transfer', async (req, res) => {
+app.post('/transfer', requireApiKey, async (req, res) => {
     try {
         const { alias, bank, dest, amount, pin } = req.body;
         if (!alias || !dest || !amount || !pin) {
@@ -189,7 +211,7 @@ app.post('/update-decision', async (req, res) => {
 });
 
 // 6. API History & Data
-app.get('/api/history', async (req, res) => {
+app.get('/api/history', requireAuth, async (req, res) => {
     try {
         // Query History (7 Hari Terakhir)
         const [rows] = await pool.execute(`
@@ -205,7 +227,7 @@ app.get('/api/history', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/pending-validations', async (req, res) => {
+app.get('/api/pending-validations', requireAuth, async (req, res) => {
     try {
         const [rows] = await pool.execute(`
             SELECT v.*, r.amount as original_amount, r.dest as original_dest
@@ -219,12 +241,12 @@ app.get('/api/pending-validations', async (req, res) => {
 });
 
 // Serve HTML
-app.get(['/', '/dashboard', '/history'], (req, res) => res.send(getHtmlUI()));
+app.get(['/', '/dashboard', '/history'], requireAuth, (req, res) => res.send(getHtmlUI()));
 
 // Cleanup
 setInterval(async () => {
     try {
-        const sql = `UPDATE transfer_request SET status = 'PENDING', message = 'Auto-reset: Timeout' 
+        const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset: Timeout' 
                      WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 10 MINUTE)`;
         await pool.execute(sql);
     } catch (err) { }
