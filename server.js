@@ -135,6 +135,7 @@ app.post('/update-task', async (req, res) => {
 app.post('/validate-confirmation', async (req, res) => {
     try {
         const d = req.body;
+        console.log
         // Insert/Update tabel validation menggunakan ID String
         await pool.execute(
             `INSERT INTO transfer_validations 
@@ -151,6 +152,8 @@ app.post('/validate-confirmation', async (req, res) => {
         // Broadcast ke Dashboard
         io.emit('new_validation', {
             ...d,
+            target_name_extracted: d.account_name_extracted,
+            target_rek_extracted:d.account_number_extracted,
             original_amount: reqData[0]?.amount || 0,
             original_dest: reqData[0]?.dest || '-',
             created_at: new Date()
