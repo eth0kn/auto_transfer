@@ -35,17 +35,17 @@ function generateTrxId() {
     return `TRX-${random}`;
 }
 
-const requireAuth = (req, res, next) => {
-    const auth = { login: process.env.DASHBOARD_USER || 'admin', password: process.env.DASHBOARD_PASS || 'admin123' };
-    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
-    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
+const cookieParser = require('cookie-parser'); // [PATCH] Tambahkan ini
+app.use(cookieParser()); // [PATCH] Gunakan middleware cookie
 
-    if (login && password && login === auth.login && password === auth.password) {
+// --- [PATCH] MIDDLEWARE AUTH BARU ---
+const requireAuth = (req, res, next) => {
+    // Cek apakah ada cookie 'isLoggedIn' dengan nilai true
+    if (req.cookies.isLoggedIn === 'true') {
         return next();
     }
-
-    res.set('WWW-Authenticate', 'Basic realm="401"'); // Memicu popup browser
-    res.status(401).send('Akses ditolak: Password diperlukan.');
+    // Jika tidak ada, lempar ke halaman login
+    res.redirect('/login');
 };
 
 // 2. Cek API Key (Untuk Inject Tugas)
@@ -243,19 +243,29 @@ app.get('/api/pending-validations', requireAuth, async (req, res) => {
 // Serve HTML
 app.get(['/', '/dashboard', '/history'], requireAuth, (req, res) => res.send(getHtmlUI()));
 
+// Endpoint Login Page
+app.get('/login', (req, res) => {
+    res.send(getLoginUI()); // Kita akan buat fungsi UI login di bawah
+});
+
+// Endpoint Proses Login (POST)
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body;
+    const validUser = process.env.DASHBOARD_USER || 'admin';
+    const validPass = process.env.DASHBOARD_PASS || 'admin123';
+
+    if (username === validUser && password === validPass) {
+        // Set cookie selama 24 jam
+        res.cookie('isLoggedIn', 'true', { maxAge: 86400000, httpOnly: true });
+        return res.json({ success: true });
+    }
+    res.status(401).json({ success: false, msg: 'Username atau Password salah' });
+});
+
+// Endpoint Logout (Hapus Cookie)
 app.get('/logout', (req, res) => {
-    // Mengirim kembali header auth agar browser meminta input baru
-    res.set('WWW-Authenticate', 'Basic realm="401"');
-    res.status(401).send(`
-        <!DOCTYPE html>
-        <html>
-        <body style="background:#0f172a; color:#e2e8f0; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0;">
-            <h2 style="color:#ef4444;">Logged Out</h2>
-            <p>Sesi Anda telah dihentikan.</p>
-            <a href="/dashboard" style="color:#3b82f6; text-decoration:none; border:1px solid #3b82f6; padding:8px 16px; border-radius:8px;">Login Kembali</a>
-        </body>
-        </html>
-    `);
+    res.clearCookie('isLoggedIn');
+    res.redirect('/login');
 });
 
 // Cleanup
@@ -270,6 +280,69 @@ setInterval(async () => {
 server.listen(PORT, () => {
     console.log(`🚀 Server (TRX-ID) running on Port ${PORT}`);
 });
+
+function getLoginUI() {
+    return `
+<!DOCTYPE html>
+<html lang="id" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>Login - BotCommander</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>body { font-family: 'Inter', sans-serif; background-color: #0f172a; }</style>
+</head>
+<body class="flex items-center justify-center min-h-screen">
+    <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl border border-white/5 w-full max-w-md">
+        <div class="text-center mb-8">
+            <h1 class="text-2xl font-bold text-white">Bot<span class="text-blue-400">Commander</span></h1>
+            <p class="text-slate-400 mt-2">Silakan login untuk mengakses Dashboard</p>
+        </div>
+        <div class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-slate-300 mb-1">Username</label>
+                <input type="text" id="user" class="w-full bg-slate-900 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-slate-300 mb-1">Password</label>
+                <input type="password" id="pass" class="w-full bg-slate-900 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button onclick="doLogin()" id="btnLogin" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 rounded-lg transition">Login</button>
+            <p id="errMsg" class="text-red-400 text-sm text-center hidden"></p>
+        </div>
+    </div>
+    <script>
+        async function doLogin() {
+            const username = document.getElementById('user').value;
+            const password = document.getElementById('pass').value;
+            const btn = document.getElementById('btnLogin');
+            const msg = document.getElementById('errMsg');
+
+            btn.innerText = 'Checking...';
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json();
+            if(data.success) {
+                window.location.href = '/dashboard';
+            } else {
+                btn.innerText = 'Login';
+                msg.innerText = data.msg;
+                msg.classList.remove('hidden');
+            }
+        }
+    </script>
+</body>
+</html>`;
+}
+
+function handleLogout() {
+    if (confirm('Apakah Anda yakin ingin logout?')) {
+        window.location.href = '/logout';
+    }
+}
 
 // --- D. FRONTEND TEMPLATE ---
 function getHtmlUI() {
