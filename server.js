@@ -52,6 +52,7 @@ const requireAuth = (req, res, next) => {
 const requireApiKey = (req, res, next) => {
     const key = req.headers['x-api-key'];
     if (!key || key !== process.env.API_KEY) {
+        console.log(`🛑 someone trying to create task...`)
         return res.status(401).json({ success: false, msg: "Invalid or Missing X-API-KEY" });
     }
     next();
