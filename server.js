@@ -256,7 +256,7 @@ app.post('/api/login', (req, res) => {
 
     if (username === validUser && password === validPass) {
         // Set cookie selama 24 jam
-        res.cookie('isLoggedIn', 'true', { maxAge: 86400000, httpOnly: true });
+        res.cookie('isLoggedIn', 'true', { maxAge: 14400, httpOnly: true });
         return res.json({ success: true });
     }
     res.status(401).json({ success: false, msg: 'Username atau Password salah' });
