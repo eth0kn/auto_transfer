@@ -195,7 +195,7 @@ app.get('/api/history', async (req, res) => {
                    v.target_name_extracted, v.bank_name
             FROM transfer_request r
             LEFT JOIN transfer_validations v ON r.id = v.task_id
-            WHERE r.status IN ('SUCCESS', 'FAILED')
+            WHERE r.status IN ('SUCCESS', 'FAILED') AND r.updated_at >= (NOW() - INTERVAL 7 DAY)
             ORDER BY r.updated_at DESC LIMIT 50
         `);
         res.json(rows);
