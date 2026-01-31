@@ -178,9 +178,10 @@ app.get('/get-validation-decision/:task_id', async (req, res) => {
 app.post('/update-decision', async (req, res) => {
     try {
         const { task_id, status } = req.body;
+        const msg = req.body.message || "Rejected by Admin";
         await pool.execute('UPDATE transfer_validations SET status = ? WHERE task_id = ?', [status, task_id]);
         if (status === 'ABORT') {
-            await pool.execute('UPDATE transfer_request SET status = "FAILED", message = "Rejected by Admin" WHERE id = ?', [task_id]);
+            await pool.execute(`UPDATE transfer_request SET status = "FAILED", message = ${msg} WHERE id = ?`, [task_id]);
         }
         io.emit('decision_updated', { task_id, status });
         res.json({ success: true });
