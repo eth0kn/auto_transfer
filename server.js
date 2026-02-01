@@ -566,8 +566,8 @@ function getHtmlUI() {
             const timerInterval = setInterval(() => {
                 const now = Date.now();
                 const remaining = Math.round((expiryTime - now) / 1000);
-                const bar = document.getElementById('timer - bar - ${ d.task_id } ');
-                const text = document.getElementById('timer - text - ${ d.task_id }');
+                const bar = document.getElementById('timer -' bar - ${ d.task_id });
+                const text = document.getElementById('timer -' text - ${ d.task_id });
 
                 if (remaining <= 0) {
                     if(text) text.innerText = "EXPIRED";
