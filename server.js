@@ -525,59 +525,64 @@ function getHtmlUI() {
             tr.id = 'row-' + d.task_id;
             tr.className = 'animate-slide-in hover:bg-white/5 transition duration-200';
             
+            // Hitung waktu
             const startTime = d.created_at ? new Date(d.created_at).getTime() : Date.now();
             const expiryTime = startTime + 60000;
 
             const isMatch = Math.abs(d.total_amount - d.original_amount) <= 6500;
             const amountClass = isMatch ? 'text-green-400' : 'text-amber-400';
-            //const amountNote = isMatch ? '' : '<div class="text-[10px] text-amber-500 mt-1">Mismatch Warning</div>';
 
+            // GUNAKAN BACKSLASH (\) DI DEPAN SETIAP
             tr.innerHTML = \`
                 <td class="p-5 align-top">
-                    <div class="font-mono text-sm font-bold text-blue-400">${d.task_id}</div>
-                    <div class="text-xs text-slate-500 mt-1">${moment(startTime).format('HH:mm:ss')}</div>
+                    <div class="font-mono text-sm font-bold text-blue-400">\${d.task_id}</div>
+                    <div class="text-xs text-slate-500 mt-1">\${moment(startTime).format('HH:mm:ss')}</div>
                     <div class="w-full bg-slate-700 h-1 mt-3 rounded-full overflow-hidden">
-                        <div id="timer-bar-${d.task_id}" class="bg-blue-500 h-full transition-all duration-1000" style="width: 100%"></div>
+                        <div id="timer-bar-\${d.task_id}" class="bg-blue-500 h-full transition-all duration-1000" style="width: 100%"></div>
                     </div>
                 </td>
                 <td class="p-5 align-top">
                     <div class="flex flex-col gap-1">
-                        <span class="text-white font-semibold">${d.target_name_extracted}</span>
+                        <span class="text-white font-semibold">\${d.target_name_extracted}</span>
                         <div class="flex items-center gap-2 text-xs">
-                            <span class="bg-blue-500/10 text-blue-400 px-2 py-0.5 rounded border border-blue-500/20">${d.bank_name}</span>
-                            <span class="font-mono text-slate-400">${d.target_rek_extracted}</span>
+                            <span class="bg-blue-500/10 text-blue-400 px-2 py-0.5 rounded border border-blue-500/20">\${d.bank_name}</span>
+                            <span class="font-mono text-slate-400">\${d.target_rek_extracted}</span>
                         </div>
                     </div>
                 </td>
                 <td class="p-5 align-top text-right">
-                    <div class="text-lg font-bold ${amountClass}">${formatRupiah(d.total_amount)}</div>
-                    <div class="text-[10px] text-slate-500 mt-1">Sisa: <span id="timer-text-${d.task_id}" class="font-mono">60s</span></div>
+                    <div class="text-lg font-bold \${amountClass}">\${formatRupiah(d.total_amount)}</div>
+                    <div class="text-[10px] text-slate-500 mt-1">Sisa: <span id="timer-text-\${d.task_id}" class="font-mono">60s</span></div>
                 </td>
                 <td class="p-5 align-top text-center">
                     <div class="flex gap-2 justify-center">
-                        <button onclick="decide('${d.task_id}', 'PROCEED')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition transform hover:scale-105">ACCEPT</button>
-                        <button onclick="decide('${d.task_id}', 'ABORT')" class="bg-slate-700 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition transform hover:scale-105">REJECT</button>
+                        <button onclick="decide('\${d.task_id}', 'PROCEED')" class="bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition transform hover:scale-105">ACCEPT</button>
+                        <button onclick="decide('\${d.task_id}', 'ABORT')" class="bg-slate-700 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition transform hover:scale-105">REJECT</button>
                     </div>
                 </td>
             \`;
             document.getElementById('validation-list').prepend(tr);
             
-            // [PATCH] Jalankan Timer Interval khusus baris ini
+            // LOGIKA TIMER (PEMBERSIHAN SPASI ID)
             const timerInterval = setInterval(() => {
                 const now = Date.now();
                 const remaining = Math.round((expiryTime - now) / 1000);
-                const bar = document.getElementById('timer -' bar - ${ d.task_id });
-                const text = document.getElementById('timer -' text - ${ d.task_id });
+                
+                // Perhatikan: string di bawah ini tidak menggunakan \ karena berada di dalam script browser, bukan template literal Node.js
+                const bar = document.getElementById('timer-bar-' + d.task_id);
+                const text = document.getElementById('timer-text-' + d.task_id);
 
-                if (remaining <= 0) {
+                if (!bar || !text || remaining <= 0) {
                     if(text) text.innerText = "EXPIRED";
                     if(bar) bar.style.width = "0%";
                     clearInterval(timerInterval);
                 } else {
-                    if(text) text.innerText = remaining + "s";
-                    if(bar) bar.style.width = (remaining / 60 * 100) + "%";
-                    // Ubah warna jadi merah jika < 15 detik
-                    if(remaining < 15 && bar) bar.classList.replace('bg-blue-500', 'bg-red-500');
+                    text.innerText = remaining + "s";
+                    bar.style.width = (remaining / 60 * 100) + "%";
+                    if(remaining < 15) {
+                        bar.classList.remove('bg-blue-500');
+                        bar.classList.add('bg-red-500');
+                    }
                 }
             }, 1000);
             checkEmpty();
