@@ -273,7 +273,7 @@ app.get('/logout', (req, res) => {
 // Cleanup
 setInterval(async () => {
     try {
-        const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset: Timeout' 
+        const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset by system -> longer than 3 minutes' 
                      WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 3 MINUTE)`;
         await pool.execute(sql);
     } catch (err) { }
