@@ -175,6 +175,7 @@ app.post('/validate-confirmation', async (req, res) => {
         // Broadcast ke Dashboard
         io.emit('new_validation', {
             ...d,
+            alias: d.account_name,
             target_name_extracted: d.account_name_extracted,
             target_rek_extracted:d.account_number_extracted,
             original_amount: reqData[0]?.amount || 0,
@@ -273,7 +274,7 @@ app.get('/logout', (req, res) => {
 setInterval(async () => {
     try {
         const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset: Timeout' 
-                     WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 10 MINUTE)`;
+                     WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 3 MINUTE)`;
         await pool.execute(sql);
     } catch (err) { }
 }, 60000);
@@ -539,6 +540,11 @@ function getHtmlUI() {
                     <div class="text-xs text-slate-500 mt-1">\${moment(startTime).format('HH:mm:ss')}</div>
                     <div class="w-full bg-slate-700 h-1 mt-3 rounded-full overflow-hidden">
                         <div id="timer-bar-\${d.task_id}" class="bg-blue-500 h-full transition-all duration-1000" style="width: 100%"></div>
+                    </div>
+                </td>
+                <td>
+                    <div class="flex flex-col gap-1">
+                        <span class="text-white font-semibold">\${d.alias}</span>
                     </div>
                 </td>
                 <td class="p-5 align-top">
