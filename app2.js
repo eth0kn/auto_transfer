@@ -133,11 +133,10 @@ app.post('/update-task', async (req, res) => {
         if (!['SUCCESS', 'FAILED'].includes(status)) return res.status(400).json({ msg: "Invalid Status" });
 
         let refNumber = null;
-        let finalMessage = null;
+        let finalMessage = message;
         try {
             const msgObj = JSON.parse(message);
             if (msgObj.ref_number) refNumber = msgObj.ref_number;
-            if (msgObj.status) finalMessage = `Transfer to "${msgObj.details.target_name} | ${msgObj.details.bank}-${msgObj.details.target_rek} | ${msgObj.details.amount} Approved by admin`;
         } catch (e) { }
 
         await pool.execute(
@@ -162,10 +161,10 @@ app.post('/validate-confirmation', async (req, res) => {
         console.log
         // Insert/Update tabel validation menggunakan ID String
         await pool.execute(
-            `INSERT INTO transfer_validations 
-            (task_id, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING') 
-            ON DUPLICATE KEY UPDATE 
+            `INSERT INTO transfer_validations
+            (task_id, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
+            ON DUPLICATE KEY UPDATE
             status='WAITING', target_name_extracted=?, target_rek_extracted=?, updated_at=NOW()`,
             [d.task_id, d.device_id, d.account_name, d.account_name_extracted, d.account_number_extracted, d.bank_name, d.total_amount, d.account_name_extracted, d.account_number_extracted]
         );
@@ -178,7 +177,7 @@ app.post('/validate-confirmation', async (req, res) => {
             ...d,
             alias: d.account_name,
             target_name_extracted: d.account_name_extracted,
-            target_rek_extracted:d.account_number_extracted,
+            target_rek_extracted: d.account_number_extracted,
             original_amount: reqData[0]?.amount || 0,
             original_dest: reqData[0]?.dest || '-',
             created_at: new Date()
@@ -218,7 +217,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
     try {
         // Query History (7 Hari Terakhir)
         const [rows] = await pool.execute(`
-            SELECT r.id, r.bot_alias, r.dest, r.amount, r.status, r.ref_number, r.message, r.updated_at,
+            SELECT r.id, r.bot_alias, r.dest, r.amount, r.status, r.ref_number, r.updated_at,
                    v.target_name_extracted, v.bank_name
             FROM transfer_request r
             LEFT JOIN transfer_validations v ON r.id = v.task_id
@@ -234,9 +233,9 @@ app.get('/api/pending-validations', requireAuth, async (req, res) => {
     try {
         const [rows] = await pool.execute(`
             SELECT v.*, r.amount as original_amount, r.dest as original_dest
-            FROM transfer_validations v 
-            JOIN transfer_request r ON v.task_id = r.id 
-            WHERE v.status = 'WAITING' 
+            FROM transfer_validations v
+            JOIN transfer_request r ON v.task_id = r.id
+            WHERE v.status = 'WAITING'
             ORDER BY v.created_at DESC
         `);
         res.json(rows);
@@ -274,7 +273,7 @@ app.get('/logout', (req, res) => {
 // Cleanup
 setInterval(async () => {
     try {
-        const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset by system -> longer than 3 minutes' 
+        const sql = `UPDATE transfer_request SET status = 'FAILED', message = 'Auto-reset by system -> longer than 3 minutes'
                      WHERE status = 'PROCESSING' AND updated_at < (NOW() - INTERVAL 3 MINUTE)`;
         await pool.execute(sql);
     } catch (err) { }
@@ -400,7 +399,7 @@ function getHtmlUI() {
     </nav>
 
     <main class="flex-grow p-6 max-w-7xl mx-auto w-full">
-        
+
         <div id="view-dashboard" class="space-y-6">
             <div class="flex justify-between items-end mb-6">
                 <div>
@@ -414,7 +413,6 @@ function getHtmlUI() {
                     <thead class="bg-slate-900/50 text-slate-400 uppercase text-xs font-bold tracking-wider">
                         <tr>
                             <th class="p-5">Transaction ID</th>
-                            <th class="p-5">BOT Name</th>
                             <th class="p-5">Validation Details</th>
                             <th class="p-5 text-right">Amount</th>
                             <th class="p-5 text-center">Decision</th>
@@ -452,7 +450,6 @@ function getHtmlUI() {
                             <th class="p-5">Target</th>
                             <th class="p-5 text-right">Total</th>
                             <th class="p-5 text-center">Status</th>
-                            <th class="p-5 text-center">Message</th>
                         </tr>
                     </thead>
                     <tbody id="history-list" class="divide-y divide-white/5 text-sm text-slate-300"></tbody>
@@ -475,11 +472,11 @@ function getHtmlUI() {
 
     <script>
         const socket = io();
-        
+
         socket.on('connect', () => {
             document.getElementById('socket-status').classList.replace('bg-red-500', 'bg-green-500');
         });
-        
+
         socket.on('disconnect', () => {
             document.getElementById('socket-status').classList.replace('bg-green-500', 'bg-red-500');
         });
@@ -528,7 +525,7 @@ function getHtmlUI() {
             const tr = document.createElement('tr');
             tr.id = 'row-' + d.task_id;
             tr.className = 'animate-slide-in hover:bg-white/5 transition duration-200';
-            
+
             // Hitung waktu
             const startTime = d.created_at ? new Date(d.created_at).getTime() : Date.now();
             const expiryTime = startTime + 60000;
@@ -571,12 +568,12 @@ function getHtmlUI() {
                 </td>
             \`;
             document.getElementById('validation-list').prepend(tr);
-            
+
             // LOGIKA TIMER (PEMBERSIHAN SPASI ID)
             const timerInterval = setInterval(() => {
                 const now = Date.now();
                 const remaining = Math.round((expiryTime - now) / 1000);
-                
+
                 // Perhatikan: string di bawah ini tidak menggunakan \ karena berada di dalam script browser, bukan template literal Node.js
                 const bar = document.getElementById('timer-bar-' + d.task_id);
                 const text = document.getElementById('timer-text-' + d.task_id);
@@ -602,10 +599,10 @@ function getHtmlUI() {
             const data = await res.json();
             const tbody = document.getElementById('history-list');
             tbody.innerHTML = '';
-            
+
             data.forEach(r => {
-                const statusBadge = r.status === 'SUCCESS' 
-                    ? '<span class="px-2 py-1 bg-green-500/10 text-green-400 border border-green-500/20 rounded text-xs font-bold">SUCCESS</span>' 
+                const statusBadge = r.status === 'SUCCESS'
+                    ? '<span class="px-2 py-1 bg-green-500/10 text-green-400 border border-green-500/20 rounded text-xs font-bold">SUCCESS</span>'
                     : '<span class="px-2 py-1 bg-red-500/10 text-red-400 border border-red-500/20 rounded text-xs font-bold">FAILED</span>';
 
                 const tr = document.createElement('tr');
@@ -622,7 +619,6 @@ function getHtmlUI() {
                     </td>
                     <td class="p-5 text-right font-mono text-sm">\${formatRupiah(r.amount)}</td>
                     <td class="p-5 text-center">\${statusBadge}</td>
-                    <td class="p-5 text-center">\${r.message}</td>
                 \`;
                 tbody.appendChild(tr);
             });
@@ -668,5 +664,5 @@ function getHtmlUI() {
     </script>
 </body>
 </html>
-    `;
+`;
 }
