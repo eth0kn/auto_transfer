@@ -548,7 +548,7 @@ function getHtmlUI() {
                 </td>
                 <td>
                     <div class="flex flex-col gap-1">
-                        <span class="text-white font-semibold">\${d.alias || d.acoount_nanme}</span>
+                        <span class="text-white font-semibold">\${d.alias || d.acoount_name}</span>
                     </div>
                 </td>
                 <td class="p-5 align-top">
