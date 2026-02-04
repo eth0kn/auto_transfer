@@ -137,7 +137,7 @@ app.post('/update-task', async (req, res) => {
         try {
             const msgObj = JSON.parse(message);
             if (msgObj.ref_number) refNumber = msgObj.ref_number;
-            if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name} | ${msgObj.details.bank}-${msgObj.details.target_rek} | ${msgObj.details.amount} Approved by admin`;
+            if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name} | ${msgObj.details.bank}-${msgObj.details.target_rek} | ${msgObj.details.amount} | Approved by Admin`;
             if (status === 'FAILED') finalMessage = msgObj.reason;
         } catch (e) { }
 
@@ -260,7 +260,7 @@ app.post('/api/login', (req, res) => {
 
     if (username === validUser && password === validPass) {
         // Set cookie selama 24 jam
-        res.cookie('isLoggedIn', 'true', { maxAge: 14400, httpOnly: true });
+        res.cookie('isLoggedIn', 'true', { maxAge: 4 * 60 * 60 * 1000, httpOnly: true });
         return res.json({ success: true });
     }
     res.status(401).json({ success: false, msg: 'Username atau Password salah' });
