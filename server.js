@@ -234,7 +234,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 app.get('/api/pending-validations', requireAuth, async (req, res) => {
     try {
         const [rows] = await pool.execute(`
-            SELECT v.*, r.amount as original_amount, r.dest as original_dest, r.account_name
+            SELECT v.*, r.amount as original_amount, r.dest as original_dest, r.bot_alias
             FROM transfer_validations v 
             JOIN transfer_request r ON v.task_id = r.id 
             WHERE v.status = 'WAITING' 
@@ -524,6 +524,7 @@ function getHtmlUI() {
 
         function addValidationRow(d) {
             checkEmpty();
+            d.alias = d.alias || d.bot_alias || d.account_name;
             if(document.getElementById('row-' + d.task_id)) return;
 
             const tr = document.createElement('tr');
@@ -548,7 +549,7 @@ function getHtmlUI() {
                 </td>
                 <td>
                     <div class="flex flex-col gap-1">
-                        <span class="text-white font-semibold">\${d.alias || d.acoount_name}</span>
+                        <span class="text-white font-semibold">\${d.alias || d.account_name}</span>
                     </div>
                 </td>
                 <td class="p-5 align-top">
