@@ -234,7 +234,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 app.get('/api/pending-validations', requireAuth, async (req, res) => {
     try {
         const [rows] = await pool.execute(`
-            SELECT v.*, r.amount as original_amount, r.dest as original_dest
+            SELECT v.*, r.amount as original_amount, r.dest as original_dest, r.account_name
             FROM transfer_validations v 
             JOIN transfer_request r ON v.task_id = r.id 
             WHERE v.status = 'WAITING' 
@@ -548,7 +548,7 @@ function getHtmlUI() {
                 </td>
                 <td>
                     <div class="flex flex-col gap-1">
-                        <span class="text-white font-semibold">\${d.alias}</span>
+                        <span class="text-white font-semibold">\${d.alias || d.acoount_nanme}</span>
                     </div>
                 </td>
                 <td class="p-5 align-top">
