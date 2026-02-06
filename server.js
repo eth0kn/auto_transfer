@@ -136,9 +136,13 @@ app.post('/update-task', async (req, res) => {
         let finalMessage = null;
         try {
             const msgObj = JSON.parse(message);
-            if (msgObj.ref_number) refNumber = msgObj.ref_number;
-            if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name}" | ${msgObj.details.bank}-${msgObj.details.target_rek} | Rp. ${msgObj.details.amount} | Approved by Admin`;
-            if (status === 'FAILED') finalMessage = msgObj.reason;
+            if (msgObj.ref_number){ 
+                refNumber = msgObj.ref_number;
+                if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name}" | ${msgObj.details.bank}-${msgObj.details.target_rek} | Rp. ${msgObj.details.amount} | Approved by Admin`;
+                if (status === 'FAILED') finalMessage = msgObj.reason;
+            } else {
+                finalMessage = message.reason ?? message;
+            }
         } catch (e) { }
 
         await pool.execute(
