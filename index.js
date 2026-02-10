@@ -46,7 +46,7 @@ io.on('connection', (socket) => {
 
     // BOT REGISTER
     socket.on('bot:register', async (payload) => {
-        const { bot_id, device_id } = payload || {};
+        const { bot_id, alias, device_id } = payload || {};
 
         if (!bot_id) {
             console.log('⚠️ bot:register without bot_id');
@@ -55,10 +55,11 @@ io.on('connection', (socket) => {
 
         socket.bot_id = bot_id;
         socket.device_id = device_id;
+        socket.alias = alias;
 
         botSockets.set(bot_id, socket);
 
-        console.log(`🤖 BOT REGISTERED: ${bot_id} (${device_id || '-'})`);
+        console.log(`🤖 BOT REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
 
         // PUSH BACKLOG TASK (PENDING) TO BOT
         try {
@@ -66,7 +67,7 @@ io.on('connection', (socket) => {
                 `SELECT * FROM transfer_request
                 WHERE bot_alias = ? AND status = 'PENDING'
                 ORDER BY created_at ASC`,
-                [bot_id]
+                [alias]
             );
 
             for (const task of rows) {
@@ -110,11 +111,11 @@ io.on('connection', (socket) => {
                     [taskId]
                 );
 
-                emitToBot(botId, 'decision', {
-                    task_id: taskId,
-                    status: 'ABORT',
-                    source: 'DISCONNECT'
-                });
+                // emitToBot(botId, 'decision', {
+                //     task_id: taskId,
+                //     status: 'ABORT',
+                //     source: 'DISCONNECT'
+                // });
 
                 taskOwner.delete(taskId);
             }
