@@ -10,6 +10,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 const botSockets = new Map();
+const validationTimers = new Map();
+const taskOwner = new Map();
 
 const PORT = process.env.PORT || 3002;
 
@@ -29,6 +31,13 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 
+function emitToBot(botId, event, payload) {
+    const sock = botSockets.get(botId);
+    if (!sock) return false;
+    sock.emit(event, payload);
+    return true;
+}
+
 // ===============================
 // SOCKET CONNECTION HANDLER
 // ===============================
@@ -36,7 +45,7 @@ io.on('connection', (socket) => {
     console.log('🔌 Socket connected:', socket.id);
 
     // BOT REGISTER
-    socket.on('bot:register', (payload) => {
+    socket.on('bot:register', async (payload) => {
         const { bot_id, device_id } = payload || {};
 
         if (!bot_id) {
@@ -50,12 +59,65 @@ io.on('connection', (socket) => {
         botSockets.set(bot_id, socket);
 
         console.log(`🤖 BOT REGISTERED: ${bot_id} (${device_id || '-'})`);
+
+        // PUSH BACKLOG TASK (PENDING) TO BOT
+        try {
+            const [rows] = await pool.execute(
+                `SELECT * FROM transfer_request
+                WHERE bot_alias = ? AND status = 'PENDING'
+                ORDER BY created_at ASC`,
+                [bot_id]
+            );
+
+            for (const task of rows) {
+                socket.emit('task:new', {
+                    task_id: task.id,
+                    bank_type: task.bank_type,
+                    destination: task.dest,
+                    amount: parseFloat(task.amount),
+                    pin: task.pin
+                });
+                taskOwner.set(task.id, bot_id);
+
+                console.log(`[BACKLOG DISPATCH] ${task.id} -> ${bot_id}`);
+
+                await pool.execute(
+                    `UPDATE transfer_request
+                    SET status = 'PROCESSING', updated_at = NOW()
+                    WHERE id = ?`,
+                    [task.id]
+                );
+            }
+        } catch (e) {
+            console.error('Backlog dispatch error:', e.message);
+        }
     });
 
-    socket.on('disconnect', (reason) => {
-        if (socket.bot_id) {
-            botSockets.delete(socket.bot_id);
-            console.log(`🔴 BOT DISCONNECTED: ${socket.bot_id} | ${reason}`);
+    socket.on('disconnect', async (reason) => {
+        if (!socket.bot_id) return;
+
+        const botId = socket.bot_id;
+        botSockets.delete(botId);
+
+        console.log(`🔴 BOT DISCONNECTED: ${botId} | ${reason}`);
+
+        for (const [taskId, owner] of taskOwner.entries()) {
+            if (owner === botId) {
+                await pool.execute(
+                    `UPDATE transfer_request 
+                    SET status = 'FAILED', message = 'Bot disconnected'
+                    WHERE id = ? AND status = 'PROCESSING'`,
+                    [taskId]
+                );
+
+                emitToBot(botId, 'decision', {
+                    task_id: taskId,
+                    status: 'ABORT',
+                    source: 'DISCONNECT'
+                });
+
+                taskOwner.delete(taskId);
+            }
         }
     });
 });
@@ -108,6 +170,23 @@ app.post('/transfer', requireApiKey, async (req, res) => {
         const sql = `INSERT INTO transfer_request (id, bot_alias, bank_type, dest, amount, pin, status) VALUES (?, ?, ?, ?, ?, ?, 'PENDING')`;
         await pool.execute(sql, [newTaskId, alias, bank || 'BRI', dest, amount, pin]);
 
+        const dispatched = emitToBot(alias, 'task:new', {
+            task_id: newTaskId,
+            bank_type: bank || 'BRI',
+            destination: dest,
+            amount: parseFloat(amount),
+            pin: pin
+        });
+
+        if (dispatched) {
+            await pool.execute(
+                `UPDATE transfer_request SET status = 'PROCESSING', updated_at = NOW() WHERE id = ?`,
+                [newTaskId]
+            );
+            taskOwner.set(newTaskId, alias);
+            console.log(`[SOCKET DISPATCH] Task ${newTaskId} -> ${alias}`);
+        }
+
         res.json({ success: true, msg: "Request masuk antrian", task_id: newTaskId });
     } catch (err) {
         res.status(500).json({ success: false, msg: err.message });
@@ -116,46 +195,10 @@ app.post('/transfer', requireApiKey, async (req, res) => {
 
 // 2. BOT: Ambil Request
 app.post('/get-task', async (req, res) => {
-    const { alias } = req.body;
-    const connection = await pool.getConnection();
-    try {
-        await connection.beginTransaction();
-        const [rows] = await connection.execute(
-            `SELECT * FROM transfer_request
-             WHERE (bot_alias = ? OR bot_alias IS NULL) AND status = 'PENDING'
-             ORDER BY created_at ASC LIMIT 1 FOR UPDATE`,
-            [alias]
-        );
-
-        if (rows.length === 0) {
-            await connection.rollback();
-            return res.json({ task_available: false });
-        }
-        const task = rows[0];
-
-        // Update status jadi PROCESSING
-        await connection.execute(
-            `UPDATE transfer_request SET status = 'PROCESSING', updated_at = NOW() WHERE id = ?`,
-            [task.id]
-        );
-        await connection.commit();
-
-        console.log(`[DISPATCH] Task ${task.id} -> Bot ${alias}`);
-        res.json({
-            task_available: true,
-            task_id: task.id, // String ID
-            bank_type: task.bank_type,
-            destination: task.dest,
-            amount: parseFloat(task.amount),
-            pin: task.pin
-        });
-    } catch (err) {
-        await connection.rollback();
-        console.error(err);
-        res.status(500).json({ task_available: false });
-    } finally {
-        connection.release();
-    }
+    return res.status(410).json({
+        success: false,
+        msg: 'Polling disabled. Use WebSocket only.'
+    });
 });
 
 // 3. BOT: Lapor Status Akhir
@@ -168,7 +211,7 @@ app.post('/update-task', async (req, res) => {
         let finalMessage = null;
         try {
             const msgObj = JSON.parse(message);
-            if (msgObj.ref_number){ 
+            if (msgObj.ref_number) {
                 refNumber = msgObj.ref_number;
                 if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name}" | ${msgObj.details.bank}-${msgObj.details.target_rek} | Rp. ${msgObj.details.amount} | Approved by Admin`;
                 if (status === 'FAILED') finalMessage = msgObj.reason;
@@ -181,6 +224,8 @@ app.post('/update-task', async (req, res) => {
             `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW() WHERE id = ?`,
             [status, finalMessage, refNumber, task_id]
         );
+
+        taskOwner.delete(task_id);
 
         // Notify Dashboard (WebSocket)
         io.emit('task_completed', { task_id, status });
@@ -215,11 +260,41 @@ app.post('/validate-confirmation', async (req, res) => {
             ...d,
             alias: d.account_name,
             target_name_extracted: d.account_name_extracted,
-            target_rek_extracted:d.account_number_extracted,
+            target_rek_extracted: d.account_number_extracted,
             original_amount: reqData[0]?.amount || 0,
             original_dest: reqData[0]?.dest || '-',
             created_at: new Date()
         });
+
+        // START VALIDATION TIMEOUT (60s)
+        if (!validationTimers.has(d.task_id)) {
+            const t = setTimeout(async () => {
+                console.log(`⏰ Validation timeout: ${d.task_id}`);
+
+                await pool.execute(
+                    'UPDATE transfer_validations SET status = ? WHERE task_id = ? AND status = ?',
+                    ['ABORT', d.task_id, 'WAITING']
+                );
+
+                await pool.execute(
+                    'UPDATE transfer_request SET status = ?, message = ? WHERE id = ? AND status = ?',
+                    ['FAILED', 'Validation timeout', d.task_id, 'PROCESSING']
+                );
+
+                const owner = taskOwner.get(d.task_id);
+                if (owner) {
+                    emitToBot(owner, 'decision', {
+                        task_id: d.task_id,
+                        status: 'ABORT',
+                        source: 'TIMEOUT'
+                    });
+                }
+
+                validationTimers.delete(d.task_id);
+            }, 60000);
+
+            validationTimers.set(d.task_id, t);
+        }
 
         res.json({ success: true });
     } catch (e) {
@@ -230,11 +305,10 @@ app.post('/validate-confirmation', async (req, res) => {
 
 // 5. Polling & Decision
 app.get('/get-validation-decision/:task_id', async (req, res) => {
-    try {
-        const [rows] = await pool.execute('SELECT status FROM transfer_validations WHERE task_id = ?', [req.params.task_id]);
-        const status = rows.length > 0 ? rows[0].status : 'WAITING';
-        res.json({ action: status === 'WAITING' ? 'WAIT' : status });
-    } catch (e) { res.json({ action: 'WAIT' }); }
+    return res.status(410).json({
+        success: false,
+        msg: 'Polling disabled. Decision via WebSocket only.'
+    });
 });
 
 app.post('/update-decision', async (req, res) => {
@@ -242,9 +316,26 @@ app.post('/update-decision', async (req, res) => {
         const { task_id, status } = req.body;
         const msg = req.body.message || "Rejected by Admin";
         await pool.execute('UPDATE transfer_validations SET status = ? WHERE task_id = ?', [status, task_id]);
+        // CLEAR TIMEOUT
+        if (validationTimers.has(task_id)) {
+            clearTimeout(validationTimers.get(task_id));
+            validationTimers.delete(task_id);
+        }
+
+        // EMIT DECISION TO BOT
+        const owner = taskOwner.get(task_id);
+        if (owner) {
+            emitToBot(owner, 'decision', {
+                task_id,
+                status,
+                source: 'ADMIN'
+            });
+        }
+
         if (status === 'ABORT') {
             await pool.execute(`UPDATE transfer_request SET status = 'FAILED', message = ? WHERE id = ?`, [msg, task_id]);
         }
+
         io.emit('decision_updated', { task_id, status });
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
