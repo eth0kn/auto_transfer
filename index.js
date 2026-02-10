@@ -98,9 +98,10 @@ io.on('connection', (socket) => {
         if (!socket.bot_id) return;
 
         const botId = socket.bot_id;
+        const alias = socket.alias;
         botSockets.delete(botId);
 
-        console.log(`🔴 BOT DISCONNECTED: ${botId} | ${reason}`);
+        console.log(`🔴 BOT DISCONNECTED: ${botId} ${alias} | ${reason}`);
 
         for (const [taskId, owner] of taskOwner.entries()) {
             if (owner === botId) {
