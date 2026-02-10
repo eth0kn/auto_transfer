@@ -48,6 +48,11 @@ io.on('connection', (socket) => {
     socket.on('bot:register', async (payload) => {
         const { bot_id, alias, device_id } = payload || {};
 
+        if (!alias) {
+            console.log('❌ bot:register missing alias');
+            return;
+        }
+
         if (!bot_id) {
             console.log('⚠️ bot:register without bot_id');
             return;
@@ -57,7 +62,7 @@ io.on('connection', (socket) => {
         socket.device_id = device_id;
         socket.alias = alias;
 
-        botSockets.set(bot_id, socket);
+        botSockets.set(alias, socket);
 
         console.log(`🤖 BOT REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
 
