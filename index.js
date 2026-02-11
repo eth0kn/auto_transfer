@@ -307,13 +307,13 @@ app.post('/validate-confirmation', async (req, res) => {
                     });
                 }
 
+                io.emit('decision_updated', {
+                    task_id: d.task_id,
+                    status: 'ABORT'
+                });
+
                 validationTimers.delete(d.task_id);
             }, 60000);
-
-            io.emit('decision_updated', {
-                task_id: d.task_id,
-                status: 'ABORT'
-            });
 
             validationTimers.set(d.task_id, t);
         }
