@@ -86,13 +86,6 @@ io.on('connection', (socket) => {
                 taskOwner.set(task.id, bot_id);
 
                 console.log(`[BACKLOG DISPATCH] ${task.id} -> ${bot_id}`);
-
-                await pool.execute(
-                    `UPDATE transfer_request
-                    SET status = 'PROCESSING', updated_at = NOW()
-                    WHERE id = ?`,
-                    [task.id]
-                );
             }
         } catch (e) {
             console.error('Backlog dispatch error:', e.message);
