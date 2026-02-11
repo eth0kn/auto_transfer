@@ -83,7 +83,7 @@ io.on('connection', (socket) => {
                     amount: parseFloat(task.amount),
                     pin: task.pin
                 });
-                taskOwner.set(task.id, bot_id);
+                taskOwner.set(task.id, alias);
 
                 console.log(`[BACKLOG DISPATCH] ${task.id} -> ${bot_id}`);
             }
