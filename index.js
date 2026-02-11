@@ -58,13 +58,19 @@ io.on('connection', (socket) => {
             return;
         }
 
+        const isReRegister = botSockets.has(alias);
+
         socket.bot_id = bot_id;
         socket.device_id = device_id;
         socket.alias = alias;
 
         botSockets.set(alias, socket);
 
-        console.log(`🤖 BOT REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
+        if (isReRegister) {
+            console.log(`🔁 BOT RE-REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
+        } else {
+            console.log(`🤖 BOT REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
+        }
 
         // PUSH BACKLOG TASK (PENDING) TO BOT
         try {
