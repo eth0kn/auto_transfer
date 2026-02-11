@@ -99,6 +99,22 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('task:ack', async ({ task_id }) => {
+        try {
+            await pool.execute(
+                `UPDATE transfer_request
+                SET status = 'PROCESSING', updated_at = NOW()
+                WHERE id = ?
+                AND status = 'PENDING'
+                AND bot_alias = ?`,
+                [task_id, socket.alias]
+            );
+            console.log(`[ACK] ${socket.alias} accepted task ${task_id}`);
+        } catch (e) {
+            console.error(`[ACK ERROR] ${task_id}`, e.message);
+        }
+    });
+
     socket.on('disconnect', async (reason) => {
         if (!socket.bot_id) return;
 
@@ -186,12 +202,8 @@ app.post('/transfer', requireApiKey, async (req, res) => {
         });
 
         if (dispatched) {
-            await pool.execute(
-                `UPDATE transfer_request SET status = 'PROCESSING', updated_at = NOW() WHERE id = ?`,
-                [newTaskId]
-            );
             taskOwner.set(newTaskId, alias);
-            console.log(`[SOCKET DISPATCH] Task ${newTaskId} -> ${alias}`);
+            console.log(`[SOCKET EMIT] Task ${newTaskId} -> ${alias} (status=PENDING)`);
         }
 
         res.json({ success: true, msg: "Request masuk antrian", task_id: newTaskId });
@@ -214,18 +226,23 @@ app.post('/update-task', async (req, res) => {
         const { task_id, status, message } = req.body;
         if (!['SUCCESS', 'FAILED'].includes(status)) return res.status(400).json({ msg: "Invalid Status" });
 
+        let finalMessage = '';
         let refNumber = null;
-        let finalMessage = null;
+
+        let msgObj = null;
         try {
-            const msgObj = JSON.parse(message);
-            if (msgObj.ref_number) {
-                refNumber = msgObj.ref_number;
-                if (status === 'SUCCESS') finalMessage = `Transfer to "${msgObj.details.target_name}" | ${msgObj.details.bank}-${msgObj.details.target_rek} | Rp. ${msgObj.details.amount} | Approved by Admin`;
-                if (status === 'FAILED') finalMessage = msgObj.reason;
-            } else {
-                finalMessage = message.reason ?? message;
-            }
-        } catch (e) { }
+            msgObj = typeof message === 'string' ? JSON.parse(message) : message;
+        } catch (e) {
+            msgObj = { text: String(message) };
+        }
+
+        // Text utama (dashboard)
+        finalMessage = msgObj.text || msgObj.reason || '';
+
+        // Reference number
+        if (msgObj.ref_number) {
+            refNumber = msgObj.ref_number;
+        }
 
         await pool.execute(
             `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW() WHERE id = ?`,
