@@ -158,7 +158,7 @@ app.post('/update-task', async (req, res) => {
 app.post('/validate-confirmation', async (req, res) => {
     try {
         const d = req.body;
-        console.log
+        console.log(`[VALIDATION] Received data for ${d.task_id}`);
         // Insert/Update tabel validation menggunakan ID String
         await pool.execute(
             `INSERT INTO transfer_validations
@@ -232,9 +232,9 @@ app.get('/api/history', requireAuth, async (req, res) => {
 app.get('/api/pending-validations', requireAuth, async (req, res) => {
     try {
         const [rows] = await pool.execute(`
-            SELECT v.*, r.amount as original_amount, r.dest as original_dest
-            FROM transfer_validations v
-            JOIN transfer_request r ON v.task_id = r.id
+            SELECT v.*, r.amount as original_amount, r.dest as original_dest, r.bot_alias
+            FROM transfer_validations v 
+            JOIN transfer_request r ON v.task_id = r.id 
             WHERE v.status = 'WAITING'
             ORDER BY v.created_at DESC
         `);
@@ -258,7 +258,7 @@ app.post('/api/login', (req, res) => {
 
     if (username === validUser && password === validPass) {
         // Set cookie selama 24 jam
-        res.cookie('isLoggedIn', 'true', { maxAge: 14400, httpOnly: true });
+        res.cookie('isLoggedIn', 'true', { maxAge: 4 * 60 * 60 * 1000, httpOnly: true });
         return res.json({ success: true });
     }
     res.status(401).json({ success: false, msg: 'Username atau Password salah' });
@@ -520,6 +520,7 @@ function getHtmlUI() {
 
         function addValidationRow(d) {
             checkEmpty();
+            d.alias = d.alias || d.bot_alias || d.account_name;
             if(document.getElementById('row-' + d.task_id)) return;
 
             const tr = document.createElement('tr');
