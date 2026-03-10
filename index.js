@@ -361,7 +361,16 @@ app.post('/update-decision', async (req, res) => {
         }
 
         if (status === 'ABORT') {
-            await pool.execute(`UPDATE transfer_request SET status = 'FAILED', message = ? WHERE id = ?`, [msg, task_id]);
+            if (msg === 'Rejected by Admin') {
+                // Jika ini dari Admin (Default Message), paksa update
+                await pool.execute(`UPDATE transfer_request SET status = 'FAILED', message = ? WHERE id = ?`, [msg, task_id]);
+            } else {
+                // Jika ini dari Bot (misal: timeout auto rejected), jangan update jika sudah Rejected by Admin
+                await pool.execute(
+                    `UPDATE transfer_request SET status = 'FAILED', message = ? WHERE id = ? AND message != 'Rejected by Admin'`, 
+                    [msg, task_id]
+                );
+            }
         }
 
         io.emit('decision_updated', { task_id, status });
