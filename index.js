@@ -31,8 +31,8 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 
-function emitToBot(botId, event, payload) {
-    const sock = botSockets.get(botId);
+function emitToBot(alias, event, payload) { // [REFACTOR] Ganti nama parameter agar lebih jelas
+    const sock = botSockets.get(alias);
     if (!sock) return false;
     sock.emit(event, payload);
     return true;
@@ -121,7 +121,7 @@ io.on('connection', (socket) => {
 
         const botId = socket.bot_id;
         const alias = socket.alias;
-        botSockets.delete(botId);
+        botSockets.delete(alias); // [FIX] Gunakan 'alias' sebagai kunci untuk menghapus, bukan 'botId'
 
         console.log(`🔴 BOT DISCONNECTED: ${botId} ${alias} | ${reason}`);
 
