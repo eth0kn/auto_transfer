@@ -87,7 +87,8 @@ io.on('connection', (socket) => {
                     bank_type: task.bank_type,
                     destination: task.dest,
                     amount: parseFloat(task.amount),
-                    pin: task.pin
+                    pin: task.pin,
+                    alias: task.bot_alias // [FIX] Sertakan alias di payload backlog
                 });
                 taskOwner.set(task.id, alias);
 
@@ -198,7 +199,8 @@ app.post('/transfer', requireApiKey, async (req, res) => {
             bank_type: bank || 'BRI',
             destination: dest,
             amount: parseFloat(amount),
-            pin: pin
+            pin: pin,
+            alias: alias // [FIX] Sertakan alias di payload tugas baru
         });
 
         if (dispatched) {
