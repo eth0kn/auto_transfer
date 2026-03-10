@@ -91,7 +91,7 @@ io.on('connection', (socket) => {
                 });
                 taskOwner.set(task.id, alias);
 
-                console.log(`[BACKLOG DISPATCH] ${task.id} -> ${bot_id}`);
+                console.log(`[BACKLOG DISPATCH] ${task.id} -> ${alias}`);
             }
         } catch (e) {
             console.error('Backlog dispatch error:', e.message);
