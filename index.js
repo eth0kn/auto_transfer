@@ -459,7 +459,7 @@ function getLoginUI() {
 <html lang="id" class="dark">
 <head>
     <meta charset="UTF-8">
-    <title>Login - BotCommander ${APP_NAME}</title>
+    <title>${APP_NAME}-BOT Login</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>body { font-family: 'Inter', sans-serif; background-color: #0f172a; }</style>
@@ -467,7 +467,7 @@ function getLoginUI() {
 <body class="flex items-center justify-center min-h-screen">
     <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl border border-white/5 w-full max-w-md">
         <div class="text-center mb-8">
-            <h1 class="text-2xl font-bold text-white">Bot<span class="text-blue-400">Commander</span></h1>
+            <h1 class="text-2xl font-bold text-white">Bot<span class="text-blue-400">Commander ${APP_NAME}</span></h1>
             <p class="text-slate-400 mt-2">Silakan login untuk mengakses Dashboard</p>
         </div>
         <div class="space-y-4">
