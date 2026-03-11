@@ -14,6 +14,7 @@ const validationTimers = new Map();
 const taskOwner = new Map();
 
 const PORT = process.env.PORT || 3002;
+const APP_NAME = process.env.APP_NAME;
 //console.log(test);
 app.use(cors());
 app.use(express.json());
@@ -458,7 +459,7 @@ function getLoginUI() {
 <html lang="id" class="dark">
 <head>
     <meta charset="UTF-8">
-    <title>Login - BotCommander</title>
+    <title>Login - BotCommander ${APP_NAME}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>body { font-family: 'Inter', sans-serif; background-color: #0f172a; }</style>
