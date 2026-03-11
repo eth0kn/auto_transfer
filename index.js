@@ -126,7 +126,7 @@ io.on('connection', (socket) => {
         console.log(`🔴 BOT DISCONNECTED: ${botId} ${alias} | ${reason}`);
 
         for (const [taskId, owner] of taskOwner.entries()) {
-            if (owner === botId) {
+            if (owner === alias) {
                 await pool.execute(
                     `UPDATE transfer_request 
                     SET status = 'FAILED', message = 'Bot disconnected'
