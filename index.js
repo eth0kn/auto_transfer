@@ -550,7 +550,7 @@ function getHtmlUI() {
                     <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/30">
                         <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
                     </div>
-                    <span class="text-xl font-bold tracking-tight text-white">Bot<span class="text-blue-400">Commander</span></span>
+                    <span class="text-xl font-bold tracking-tight text-white">Bot<span class="text-blue-400">Commander ${APP_NAME}</span></span>
                 </div>
                 <div class="flex bg-slate-800/50 p-1 rounded-lg border border-white/5">
                     <button onclick="switchTab('dashboard')" id="nav-dashboard" class="px-4 py-1.5 rounded-md text-sm font-medium transition-all">Live</button>
