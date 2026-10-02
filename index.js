@@ -755,7 +755,7 @@ app.get('/logout', (req, res) => {
 });
 
 // ==========================================================
-// SOCKET.IO — BOT NAMESPACES (/brimo, /mybca)
+// SOCKET.IO — BOT NAMESPACES (/brimo, /mybca, /seabank — auto dari APP_SOURCES)
 // ==========================================================
 function setupBotNamespace(app_source) {
     const ns = io.of(`/${app_source}`);
@@ -950,13 +950,13 @@ function getLoginUI() {
   :root {
     --bg: #f6f7fb; --shell: #ffffff; --input: #f2f5fa; --border: #e4e8f0;
     --fg: #0b1220; --fg-muted: #5a6b83;
-    --brimo: #2563eb; --mybca: #f97316;
+    --brimo: #2563eb; --mybca: #f97316; --seabank: #0284c7;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #070b14; --shell: #0d1421; --input: #0d1523; --border: #223047;
       --fg: #eaf1fa; --fg-muted: #94a5be;
-      --brimo: #60a5fa; --mybca: #fb923c;
+      --brimo: #60a5fa; --mybca: #fb923c; --seabank: #38bdf8;
       color-scheme: dark;
     }
   }
@@ -1074,7 +1074,7 @@ function getTailscaleRegisterUI() {
   :root {
     --bg: #f6f7fb; --shell: #ffffff; --input: #f2f5fa; --border: #e4e8f0;
     --fg: #0b1220; --fg-muted: #5a6b83;
-    --brimo: #2563eb; --mybca: #f97316;
+    --brimo: #2563eb; --mybca: #f97316; --seabank: #0284c7;
     --success: #059669; --success-bg: #ecfdf5;
     --danger: #dc2626; --danger-bg: #fee2e2;
   }
@@ -1082,7 +1082,7 @@ function getTailscaleRegisterUI() {
     :root:not([data-theme="light"]) {
       --bg: #070b14; --shell: #0d1421; --input: #0d1523; --border: #223047;
       --fg: #eaf1fa; --fg-muted: #94a5be;
-      --brimo: #60a5fa; --mybca: #fb923c;
+      --brimo: #60a5fa; --mybca: #fb923c; --seabank: #38bdf8;
       --success: #34d399; --success-bg: rgb(5 150 105 / 0.14);
       --danger: #f87171; --danger-bg: rgb(220 38 38 / 0.14);
       color-scheme: dark;
@@ -1231,6 +1231,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     --fg: #0b1220; --fg-muted: #5a6b83; --fg-subtle: #8b9aae;
     --brimo: #2563eb; --brimo-bg: #eff5ff; --brimo-strong: #1d4ed8;
     --mybca: #f97316; --mybca-bg: #fff4e6; --mybca-strong: #ea580c;
+    --seabank: #0284c7; --seabank-bg: #e0f2fe; --seabank-strong: #0369a1;
     --success: #059669; --success-bg: #ecfdf5;
     --warning: #d97706; --warning-bg: #fef3c7;
     --danger: #dc2626; --danger-bg: #fee2e2;
@@ -1249,6 +1250,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       --fg: #eaf1fa; --fg-muted: #94a5be; --fg-subtle: #6a7a92;
       --brimo: #60a5fa; --brimo-bg: rgb(37 99 235 / 0.14); --brimo-strong: #93c5fd;
       --mybca: #fb923c; --mybca-bg: rgb(249 115 22 / 0.14); --mybca-strong: #fdba74;
+      --seabank: #38bdf8; --seabank-bg: rgb(2 132 199 / 0.14); --seabank-strong: #7dd3fc;
       --success: #34d399; --success-bg: rgb(5 150 105 / 0.14);
       --warning: #fbbf24; --warning-bg: rgb(217 119 6 / 0.14);
       --danger: #f87171; --danger-bg: rgb(220 38 38 / 0.14);
@@ -1267,6 +1269,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     --fg: #eaf1fa; --fg-muted: #94a5be; --fg-subtle: #6a7a92;
     --brimo: #60a5fa; --brimo-bg: rgb(37 99 235 / 0.14); --brimo-strong: #93c5fd;
     --mybca: #fb923c; --mybca-bg: rgb(249 115 22 / 0.14); --mybca-strong: #fdba74;
+    --seabank: #38bdf8; --seabank-bg: rgb(2 132 199 / 0.14); --seabank-strong: #7dd3fc;
     --success: #34d399; --success-bg: rgb(5 150 105 / 0.14);
     --warning: #fbbf24; --warning-bg: rgb(217 119 6 / 0.14);
     --danger: #f87171; --danger-bg: rgb(220 38 38 / 0.14);
@@ -1332,6 +1335,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .bot-bank { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 4px; font-weight: 700; }
   .bot-bank.brimo { color: var(--brimo-strong); background: var(--brimo-bg); }
   .bot-bank.mybca { color: var(--mybca-strong); background: var(--mybca-bg); }
+  .bot-bank.seabank { color: var(--seabank-strong); background: var(--seabank-bg); }
 
   .sidebar-footer {
     margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border);
@@ -1461,8 +1465,10 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .tab.active { color: var(--fg); border-bottom-color: var(--tab-accent, var(--fg)); }
   .tab[data-tab="brimo"] { --tab-accent: var(--brimo); }
   .tab[data-tab="mybca"] { --tab-accent: var(--mybca); }
+  .tab[data-tab="seabank"] { --tab-accent: var(--seabank); }
   .tab[data-tab="brimo"].active { color: var(--brimo-strong); }
   .tab[data-tab="mybca"].active { color: var(--mybca-strong); }
+  .tab[data-tab="seabank"].active { color: var(--seabank-strong); }
   .tab-notif {
     display: inline-flex; align-items: center; justify-content: center;
     min-width: 20px; height: 20px; padding: 0 6px;
@@ -1473,6 +1479,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   }
   .tab[data-tab="brimo"] .tab-notif { background: var(--brimo); color: white; }
   .tab[data-tab="mybca"] .tab-notif { background: var(--mybca); color: white; }
+  .tab[data-tab="seabank"] .tab-notif { background: var(--seabank); color: white; }
   .tab-notif.pulse { animation: pulse 1.4s ease-out; }
   @keyframes pulse {
     0% { transform: scale(1); }
@@ -1535,6 +1542,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .bank-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
   .bank-badge.brimo { color: var(--brimo-strong); background: var(--brimo-bg); }
   .bank-badge.mybca { color: var(--mybca-strong); background: var(--mybca-bg); }
+  .bank-badge.seabank { color: var(--seabank-strong); background: var(--seabank-bg); }
   .status-chip {
     display: inline-flex; align-items: center; gap: 4px;
     padding: 3px 9px; border-radius: var(--radius-pill);
@@ -1565,6 +1573,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .val-card::before { content: ''; position: absolute; top: 0; left: 0; bottom: 0; width: 3px; background: var(--brimo); }
   .val-card.brimo::before { background: var(--brimo); }
   .val-card.mybca::before { background: var(--mybca); }
+  .val-card.seabank::before { background: var(--seabank); }
   .val-card-head { padding: 12px 14px 10px 14px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .val-tx-id { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--fg-muted); font-weight: 600; }
   .val-time { font-size: 11px; color: var(--fg-subtle); display: flex; align-items: center; gap: 5px; }
@@ -1578,6 +1587,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   }
   .val-card.brimo .val-avatar { background: var(--brimo); }
   .val-card.mybca .val-avatar { background: var(--mybca); }
+  .val-card.seabank .val-avatar { background: var(--seabank); }
   .val-name-block { display: flex; flex-direction: column; line-height: 1.2; overflow: hidden; min-width: 0; }
   .val-name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .val-rek { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--fg-muted); }
@@ -1588,6 +1598,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .val-fig-value { font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; }
   .val-card.brimo .val-fig-value.total { color: var(--brimo-strong); }
   .val-card.mybca .val-fig-value.total { color: var(--mybca-strong); }
+  .val-card.seabank .val-fig-value.total { color: var(--seabank-strong); }
   .val-meta { display: flex; gap: 6px; flex-wrap: wrap; font-size: 11px; color: var(--fg-subtle); }
   .val-actions { padding: 10px 14px; background: var(--bg-input); display: flex; gap: 8px; justify-content: flex-end; border-top: 1px solid var(--border); }
   .btn {
@@ -1698,7 +1709,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     <div class="top-header">
       <div class="page-title">
         <h1>Command Center</h1>
-        <div class="subtitle">Kelola validasi transfer BRImo dan myBCA di satu tempat</div>
+        <div class="subtitle">Kelola validasi transfer BRImo, myBCA, dan SeaBank di satu tempat</div>
       </div>
       <div class="header-actions">
         <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">
@@ -1745,6 +1756,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
         <button class="tab active" data-tab="all" onclick="switchTab('all')">Semua <span class="tab-notif" data-count="0">0</span></button>
         <button class="tab" data-tab="brimo" onclick="switchTab('brimo')">BRImo <span class="tab-notif" data-count="0">0</span></button>
         <button class="tab" data-tab="mybca" onclick="switchTab('mybca')">myBCA <span class="tab-notif" data-count="0">0</span></button>
+        <button class="tab" data-tab="seabank" onclick="switchTab('seabank')">SeaBank <span class="tab-notif" data-count="0">0</span></button>
       </div>
       <div class="tabs-tools">
         <div class="status-pill" id="socket-status">
@@ -1881,9 +1893,16 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     const parts = String(name).trim().split(/\\s+/);
     return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
   }
+  // Mapping bank identity. Tambah entry baru di sini untuk support fleet baru.
+  const BANK_LABELS = {
+    brimo:   { label: 'BRImo',   short: 'BRI' },
+    mybca:   { label: 'myBCA',   short: 'BCA' },
+    seabank: { label: 'SeaBank', short: 'SeaBank' }
+  };
+  function bankLabel(app_source)  { return BANK_LABELS[app_source]?.label || app_source; }
+  function bankShort(app_source)  { return BANK_LABELS[app_source]?.short || app_source; }
   function bankPill(app_source) {
-    const label = app_source === 'brimo' ? 'BRImo' : (app_source === 'mybca' ? 'myBCA' : app_source);
-    return \`<span class="bank-badge \${app_source}">\${label}</span>\`;
+    return \`<span class="bank-badge \${app_source}">\${bankLabel(app_source)}</span>\`;
   }
   function el(id) { return document.getElementById(id); }
   function escapeHtml(s) {
@@ -1953,7 +1972,9 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       const res = await fetch('/api/stats');
       const s = await res.json();
       el('stat-count').textContent = (s.today_count ?? 0).toLocaleString('id-ID');
-      el('stat-count-sub').textContent = \`BRImo \${s.by_bank?.brimo?.count ?? 0} · myBCA \${s.by_bank?.mybca?.count ?? 0}\`;
+      el('stat-count-sub').textContent = Object.keys(BANK_LABELS)
+        .map(src => \`\${bankLabel(src)} \${s.by_bank?.[src]?.count ?? 0}\`)
+        .join(' · ');
       el('stat-sum').textContent = formatRupiah(s.today_sum || 0);
       el('stat-sum-sub').textContent = \`\${s.success_count ?? 0} sukses · \${s.failed_count ?? 0} gagal\`;
       el('stat-rate').innerHTML = s.success_rate === null ? '—' : \`\${(s.success_rate * 100).toFixed(1)}<span class="unit">%</span>\`;
@@ -2017,17 +2038,19 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
         filtered.forEach(r => startCountdown(r.task_id, r.created_at));
       }
       el('val-count').textContent = \`\${filtered.length} perlu aksi\`;
-      // Notif badges (semua data, bukan filtered)
-      const brimoN = rows.filter(r => r.app_source === 'brimo').length;
-      const mybcaN = rows.filter(r => r.app_source === 'mybca').length;
-      setNotifBadge('brimo', brimoN);
-      setNotifBadge('mybca', mybcaN);
-      setNotifBadge('all', brimoN + mybcaN);
+      // Notif badges (semua data, bukan filtered) — dynamic per bank di BANK_LABELS
+      let totalN = 0;
+      for (const src of Object.keys(BANK_LABELS)) {
+        const n = rows.filter(r => r.app_source === src).length;
+        setNotifBadge(src, n);
+        totalN += n;
+      }
+      setNotifBadge('all', totalN);
     } catch (e) { console.error('loadValidations', e); }
   }
 
   function renderValCard(r) {
-    const label = r.app_source === 'brimo' ? 'BRImo' : 'myBCA';
+    const label = bankLabel(r.app_source);
     const nameShort = r.target_name_extracted || '—';
     const rek = r.target_rek_extracted || '—';
     return \`
@@ -2192,7 +2215,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
               <div class="bot-name">\${b.alias}</div>
               <div class="bot-info">\${b.device_id || '—'}</div>
             </div>
-            <span class="bot-bank \${b.app_source}">\${b.app_source === 'brimo' ? 'BRI' : 'BCA'}</span>
+            <span class="bot-bank \${b.app_source}">\${bankShort(b.app_source)}</span>
           </div>
         \`).join('');
       }
@@ -2223,8 +2246,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     });
     socket.on('new_validation', (data) => {
       loadValidations();
-      const bankLabel = data.app_source === 'brimo' ? 'BRImo' : 'myBCA';
-      showToast('info', \`📥 Validasi \${bankLabel} baru masuk\`);
+      showToast('info', \`📥 Validasi \${bankLabel(data.app_source)} baru masuk\`);
     });
     socket.on('decision_updated', () => loadValidations());
     socket.on('task_completed', () => { loadStats(); loadQueue(); loadHistory(); });
