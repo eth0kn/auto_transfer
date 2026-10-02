@@ -194,13 +194,6 @@ function createBotRouter(app_source) {
     r.post('/validate-confirmation', async (req, res) => {
         try {
             const d = req.body;
-            // Derive total: bot may send `total_amount` (legacy: full total) or `total_amount` + `fee`
-            // (new mybca v3.4.1+: total_amount = nominal only from UI "Nominal" label, fee from "Biaya").
-            // Backend sums so dashboard `Fee = total - original` renders the admin fee correctly.
-            // Backward-compat: brimo bots don't send `fee` → bodyFee=0 → derivedTotal unchanged.
-            const bodyFee = parseFloat(d.fee) || 0;
-            const derivedTotal = (parseFloat(d.total_amount) || 0) + bodyFee;
-
             await pool.execute(
                 `INSERT INTO transfer_validations
                    (task_id, app_source, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status)
@@ -214,7 +207,7 @@ function createBotRouter(app_source) {
                    updated_at = NOW()`,
                 [d.task_id, app_source, d.device_id, d.account_name,
                  d.account_name_extracted, d.account_number_extracted,
-                 d.bank_name, derivedTotal]
+                 d.bank_name, d.total_amount]
             );
 
             const [reqData] = await pool.execute(
@@ -229,8 +222,6 @@ function createBotRouter(app_source) {
                 bot_alias: d.account_name,
                 target_name_extracted: d.account_name_extracted,
                 target_rek_extracted: d.account_number_extracted,
-                total_amount: derivedTotal,
-                fee: bodyFee,
                 original_amount: reqData[0]?.amount || 0,
                 original_dest: reqData[0]?.dest || '-',
                 created_at: new Date().toISOString()
@@ -1600,7 +1591,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .val-name-block { display: flex; flex-direction: column; line-height: 1.2; overflow: hidden; min-width: 0; }
   .val-name { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .val-rek { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--fg-muted); }
-  .val-figures { display: grid; grid-template-columns: 1fr 1fr 1fr; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+  .val-figures { display: grid; grid-template-columns: 1fr; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
   .val-figures > div { padding: 8px 10px; border-right: 1px solid var(--border); }
   .val-figures > div:last-child { border-right: none; }
   .val-fig-label { font-size: 10px; color: var(--fg-subtle); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; margin-bottom: 3px; }
@@ -2083,15 +2074,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
           </div>
           <div class="val-figures">
             <div>
-              <div class="val-fig-label">Original</div>
-              <div class="val-fig-value">\${formatRupiah(r.original_amount)}</div>
-            </div>
-            <div>
-              <div class="val-fig-label">Fee</div>
-              <div class="val-fig-value">\${formatRupiah(Number(r.total_amount) - Number(r.original_amount))}</div>
-            </div>
-            <div>
-              <div class="val-fig-label">Total</div>
+              <div class="val-fig-label">Nominal</div>
               <div class="val-fig-value total">\${formatRupiah(r.total_amount)}</div>
             </div>
           </div>
