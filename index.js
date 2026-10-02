@@ -393,7 +393,7 @@ app.get('/api/history', requireAuth, async (req, res) => {
 
     try {
         const [rows] = await pool.execute(
-            `SELECT r.id, r.app_source, r.bot_alias, r.dest, r.amount, r.status, r.ref_number, r.message, r.updated_at,
+            `SELECT r.id, r.app_source, r.bot_alias, r.bank_type, r.dest, r.amount, r.status, r.ref_number, r.message, r.updated_at,
                     v.target_name_extracted, v.bank_name
              FROM transfer_request r
              LEFT JOIN transfer_validations v ON r.id = v.task_id
@@ -1828,14 +1828,15 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
               <th>TX ID</th>
               <th>App</th>
               <th>Bot</th>
-              <th>Penerima</th>
+              <th>Rekening Tujuan</th>
+              <th>Bank Tujuan</th>
               <th>Nominal</th>
               <th>Status</th>
               <th>Ref Number</th>
             </tr>
           </thead>
           <tbody id="history-tbody">
-            <tr><td colspan="8" style="text-align:center; padding: 24px; color: var(--fg-subtle);">Memuat…</td></tr>
+            <tr><td colspan="9" style="text-align:center; padding: 24px; color: var(--fg-subtle);">Memuat…</td></tr>
           </tbody>
         </table>
       </div>
@@ -2162,7 +2163,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       const rows = await res.json();
       const tbody = el('history-tbody');
       if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding: 24px; color: var(--fg-subtle);">Tidak ada data untuk filter ini</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 24px; color: var(--fg-subtle);">Tidak ada data untuk filter ini</td></tr>';
         return;
       }
       tbody.innerHTML = rows.map(r => \`
@@ -2172,6 +2173,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
           <td>\${bankPill(r.app_source)}</td>
           <td>\${r.bot_alias || '—'}</td>
           <td>\${r.target_name_extracted || r.dest || '—'} <span class="mono num-tab" style="color: var(--fg-subtle); font-size: 11px;">· \${r.dest || '—'}</span></td>
+          <td>\${r.bank_name || (r.bank_type ? r.bank_type.toUpperCase() : '—')}</td>
           <td class="col-amount">\${formatRupiah(r.amount)}</td>
           <td>
             <div class="status-cell">
