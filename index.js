@@ -194,6 +194,13 @@ function createBotRouter(app_source) {
     r.post('/validate-confirmation', async (req, res) => {
         try {
             const d = req.body;
+            // Derive total: bot may send `total_amount` (legacy: full total) or `total_amount` + `fee`
+            // (new mybca v3.4.1+: total_amount = nominal only from UI "Nominal" label, fee from "Biaya").
+            // Backend sums so dashboard `Fee = total - original` renders the admin fee correctly.
+            // Backward-compat: brimo bots don't send `fee` → bodyFee=0 → derivedTotal unchanged.
+            const bodyFee = parseFloat(d.fee) || 0;
+            const derivedTotal = (parseFloat(d.total_amount) || 0) + bodyFee;
+
             await pool.execute(
                 `INSERT INTO transfer_validations
                    (task_id, app_source, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status)
@@ -207,7 +214,7 @@ function createBotRouter(app_source) {
                    updated_at = NOW()`,
                 [d.task_id, app_source, d.device_id, d.account_name,
                  d.account_name_extracted, d.account_number_extracted,
-                 d.bank_name, d.total_amount]
+                 d.bank_name, derivedTotal]
             );
 
             const [reqData] = await pool.execute(
@@ -222,6 +229,8 @@ function createBotRouter(app_source) {
                 bot_alias: d.account_name,
                 target_name_extracted: d.account_name_extracted,
                 target_rek_extracted: d.account_number_extracted,
+                total_amount: derivedTotal,
+                fee: bodyFee,
                 original_amount: reqData[0]?.amount || 0,
                 original_dest: reqData[0]?.dest || '-',
                 created_at: new Date().toISOString()
