@@ -52,6 +52,12 @@ const botSockets = new Map();       // key: `${app_source}:${alias}` → socket
 const validationTimers = new Map(); // key: task_id → setTimeout handle
 const taskOwner = new Map();        // key: task_id → { app, alias }
 
+// F1 (2026-10-29): Auto-approve global toggle.
+// Loaded from app_config DB on boot (see loadAutoApprovalState).
+// Mutated by /api/auto-approve/{enable,disable} endpoints.
+// Read by /{app}/validate-confirmation handler to short-circuit admin decision.
+let autoApprovalEnabled = false;
+
 // ==========================================================
 // MIDDLEWARE
 // ==========================================================
@@ -95,6 +101,22 @@ function requireApiKey(app_source) {
         }
         next();
     };
+}
+
+// F1 (2026-10-29): load auto_approve_enabled from app_config DB.
+// Called once at server boot; also safe to re-invoke if ever needed.
+// Fails safe: if DB read errors, flag stays false (default disabled).
+async function loadAutoApprovalState() {
+    try {
+        const [rows] = await pool.query(
+            "SELECT value FROM app_config WHERE `key`='auto_approve_enabled'"
+        );
+        autoApprovalEnabled = !!(rows[0] && rows[0].value === 'true');
+        console.log(`✅ [boot] auto_approve_enabled = ${autoApprovalEnabled}`);
+    } catch (err) {
+        autoApprovalEnabled = false;
+        console.error(`⚠️ [boot] loadAutoApprovalState failed, default OFF — ${err.message}`);
+    }
 }
 
 // ==========================================================
@@ -215,6 +237,31 @@ function createBotRouter(app_source) {
                 [d.task_id, app_source]
             );
 
+            // F1 (2026-10-29): Auto-approve short-circuit.
+            // If global toggle ON: immediately mark PROCEED + emit decision to bot + emit
+            // decision_updated to dashboard, and SKIP timeout registration. Bot gets its
+            // decision in <500ms instead of waiting for admin or 60s timeout.
+            if (autoApprovalEnabled) {
+                await pool.execute(
+                    `UPDATE transfer_validations SET status = 'PROCEED', decision_source = 'AUTO'
+                     WHERE task_id = ? AND app_source = ?`,
+                    [d.task_id, app_source]
+                );
+                const owner = taskOwner.get(d.task_id);
+                if (owner) {
+                    emitToBot(owner.app, owner.alias, 'decision', {
+                        task_id: d.task_id, status: 'PROCEED', source: 'AUTO'
+                    });
+                } else {
+                    console.warn(`[${app_source}] [auto-approve] no taskOwner for ${d.task_id} — bot socket may be disconnected`);
+                }
+                io.emit('decision_updated', {
+                    task_id: d.task_id, status: 'PROCEED', source: 'AUTO', app_source
+                });
+                console.log(`✅ [${app_source}] [auto-approve] PROCEED ${d.task_id}`);
+                return res.json({ success: true, auto_approved: true });
+            }
+
             io.emit('new_validation', {
                 ...d,
                 app_source,
@@ -232,8 +279,9 @@ function createBotRouter(app_source) {
                 const timer = setTimeout(async () => {
                     console.log(`⏰ [${app_source}] Validation timeout: ${d.task_id}`);
                     try {
+                        // F1 (2026-10-29): persist decision_source='TIMEOUT' for audit
                         await pool.execute(
-                            `UPDATE transfer_validations SET status = 'ABORT'
+                            `UPDATE transfer_validations SET status = 'ABORT', decision_source = 'TIMEOUT'
                              WHERE task_id = ? AND status = 'WAITING'`,
                             [d.task_id]
                         );
@@ -270,8 +318,9 @@ function createBotRouter(app_source) {
             const { task_id, status } = req.body;
             const msg = req.body.message || 'Rejected by Admin';
 
+            // F1 (2026-10-29): persist decision_source='ADMIN' (prefixed route is also admin-driven)
             await pool.execute(
-                `UPDATE transfer_validations SET status = ? WHERE task_id = ? AND app_source = ?`,
+                `UPDATE transfer_validations SET status = ?, decision_source = 'ADMIN' WHERE task_id = ? AND app_source = ?`,
                 [status, task_id, app_source]
             );
             if (validationTimers.has(task_id)) {
@@ -301,6 +350,60 @@ function createBotRouter(app_source) {
             res.json({ success: true });
         } catch (e) {
             res.status(500).json({ error: e.message });
+        }
+    });
+
+    // F2 (2026-10-29): Transfer status endpoint — external client polling by task_id.
+    // Auth mirrors /transfer (X-API-KEY). Returns rich response with derived client-facing
+    // status (combination of transfer_request.status + transfer_validations.status).
+    r.get('/transfer-status/:task_id', requireApiKey(app_source), async (req, res) => {
+        const { task_id } = req.params;
+        // Format validation — TRX- prefix + 8 hex (uppercase)
+        if (!/^TRX-[A-F0-9]{8}$/.test(task_id)) {
+            return res.status(400).json({ error: 'invalid task_id format' });
+        }
+        try {
+            const [rows] = await pool.execute(`
+                SELECT tr.id AS task_id, tr.app_source, tr.status AS req_status,
+                       tr.amount, tr.dest, tr.bank_type, tr.ref_number, tr.message,
+                       tr.bot_alias, tr.created_at, tr.updated_at,
+                       tv.status AS validation_status, tv.decision_source
+                FROM transfer_request tr
+                LEFT JOIN transfer_validations tv ON tv.task_id = tr.id
+                WHERE tr.id = ? AND tr.app_source = ?
+            `, [task_id, app_source]);
+
+            if (!rows[0]) {
+                return res.status(404).json({ task_id, status: 'NOT_FOUND' });
+            }
+            const row = rows[0];
+
+            // Derive client-facing status enum
+            let clientStatus;
+            if (row.req_status === 'SUCCESS') clientStatus = 'SUCCESS';
+            else if (row.req_status === 'FAILED') clientStatus = 'FAILED';
+            else if (row.req_status === 'PENDING') clientStatus = 'PENDING';
+            else if (row.req_status === 'PROCESSING' && row.validation_status === 'WAITING') clientStatus = 'AWAITING_VALIDATION';
+            else clientStatus = 'PROCESSING';
+
+            return res.json({
+                task_id: row.task_id,
+                app_source: row.app_source,
+                status: clientStatus,
+                amount: row.amount,
+                dest: row.dest,
+                bank_type: row.bank_type,
+                ref_number: row.ref_number,
+                message: row.message,
+                validation_status: row.validation_status,
+                decision_source: row.decision_source,
+                bot_alias: row.bot_alias,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            });
+        } catch (err) {
+            console.error(`[${app_source}] [transfer-status] db error:`, err.message);
+            return res.status(500).json({ error: 'internal server error' });
         }
     });
 
@@ -336,8 +439,9 @@ app.post('/update-decision', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'validation not found' });
         }
 
+        // F1 (2026-10-29): persist decision_source='ADMIN' for audit
         await pool.execute(
-            'UPDATE transfer_validations SET status = ? WHERE task_id = ?',
+            "UPDATE transfer_validations SET status = ?, decision_source = 'ADMIN' WHERE task_id = ?",
             [status, task_id]
         );
         if (validationTimers.has(task_id)) {
@@ -676,6 +780,45 @@ app.post('/api/tailscale/auto-accept/disable', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
+// ==========================================================
+// F1 (2026-10-29): Auto-approve toggle API (global, DB-backed)
+// Pattern mirrors tailscale auto-accept above — in-memory flag + broadcast,
+// but persisted in `app_config` so flag survives PM2 restart.
+// ==========================================================
+app.get('/api/auto-approve/status', requireAuth, (req, res) => {
+    res.json({ enabled: autoApprovalEnabled });
+});
+
+app.post('/api/auto-approve/enable', requireAuth, async (req, res) => {
+    try {
+        await pool.query(
+            "UPDATE app_config SET value='true' WHERE `key`='auto_approve_enabled'"
+        );
+        autoApprovalEnabled = true;
+        console.log('✅ [auto-approve] ENABLED by admin');
+        io.emit('auto_approve:state', { enabled: true });
+        res.json({ success: true, enabled: true });
+    } catch (err) {
+        console.error('[auto-approve-enable] db error:', err);
+        res.status(500).json({ success: false, msg: 'DB error' });
+    }
+});
+
+app.post('/api/auto-approve/disable', requireAuth, async (req, res) => {
+    try {
+        await pool.query(
+            "UPDATE app_config SET value='false' WHERE `key`='auto_approve_enabled'"
+        );
+        autoApprovalEnabled = false;
+        console.log('🚫 [auto-approve] DISABLED by admin');
+        io.emit('auto_approve:state', { enabled: false });
+        res.json({ success: true, enabled: false });
+    } catch (err) {
+        console.error('[auto-approve-disable] db error:', err);
+        res.status(500).json({ success: false, msg: 'DB error' });
+    }
+});
+
 // v2.2.0: Log watcher — tail Headscale docker log, extract new auth-ids
 const AUTH_ID_LOG_REGEX = /starting node registration using auth id: (hskey-authreq-[a-zA-Z0-9_-]+)/;
 let headscaleLogWatcher = null;
@@ -932,6 +1075,8 @@ server.listen(PORT, () => {
     console.log(`   Stale PENDING threshold: ${PENDING_STALE_MS}ms (${Math.round(PENDING_STALE_MS/60000)} min)`);
     console.log(`   Legacy unprefixed routes: ${LEGACY_UNPREFIXED ? 'ENABLED' : 'disabled'}`);
     console.log('==========================================');
+    // F1 (2026-10-29): load auto-approve flag from DB (fire-and-forget, logs own result)
+    loadAutoApprovalState();
 });
 
 // ==========================================================
@@ -1363,6 +1508,39 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   }
   .icon-btn:hover { color: var(--fg); border-color: var(--border-strong); background: var(--bg-input); }
 
+  /* 2026-10-29 F1: Auto-Approve toggle (amber accent) + warning banner */
+  .aa-toggle {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: var(--radius-sm);
+    background: var(--bg-elev); border: 1px solid var(--border);
+    color: var(--fg-muted); cursor: pointer;
+    font-family: inherit; font-size: 12px; font-weight: 600;
+    transition: all 0.15s;
+  }
+  .aa-toggle:hover { border-color: var(--border-strong); background: var(--bg-input); }
+  .aa-toggle.on {
+    color: #f59e0b; border-color: #f59e0b;
+    background: color-mix(in oklab, #f59e0b 12%, transparent);
+  }
+  .aa-toggle-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--fg-subtle); flex-shrink: 0;
+  }
+  .aa-toggle.on .aa-toggle-dot {
+    background: #f59e0b;
+    box-shadow: 0 0 0 3px color-mix(in oklab, #f59e0b 25%, transparent);
+    animation: ts-pulse 2s infinite;
+  }
+  .aa-warning {
+    margin: 12px 0;
+    padding: 10px 14px;
+    background: color-mix(in oklab, #f59e0b 12%, transparent);
+    border-left: 3px solid #f59e0b;
+    border-radius: var(--radius-sm);
+    font-size: 12px; color: var(--fg);
+  }
+  .aa-warning strong { color: #f59e0b; }
+
   /* v2.2.0: Tailscale Auto-Accept toggle di header */
   .ts-toggle {
     display: inline-flex; align-items: center; gap: 8px;
@@ -1725,7 +1903,16 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
           <span class="ts-toggle-dot" id="ts-toggle-dot"></span>
           <span class="ts-toggle-text" id="ts-toggle-text">Auto-Accept: OFF</span>
         </button>
+        <button class="aa-toggle" id="aa-toggle" onclick="toggleAutoApprove()" title="Toggle Auto-Approve — SEMUA transaksi (brimo+mybca+seabank) di-approve otomatis tanpa review admin">
+          <span class="aa-toggle-dot" id="aa-toggle-dot"></span>
+          <span class="aa-toggle-text" id="aa-toggle-text">Auto-Approve: OFF</span>
+        </button>
       </div>
+    </div>
+
+    <!-- 2026-10-29 F1: Warning banner saat Auto-Approve ON -->
+    <div class="aa-warning" id="aa-warning" style="display:none">
+      ⚠️ <strong>Auto-Approve AKTIF</strong> — SEMUA transaksi (BRImo + myBCA + SeaBank) di-approve otomatis tanpa review admin. Pastikan matikan kembali setelah selesai.
     </div>
 
     <div class="stats-grid">
@@ -2249,6 +2436,8 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     socket.on('bot:status', () => loadBots());
     // v2.2.0: Tailscale auto-accept + pending register events
     socket.on('tailscale:auto_accept_state', (data) => renderAutoAcceptToggle(data));
+    // 2026-10-29 F1: cross-session sync untuk Auto-Approve toggle
+    socket.on('auto_approve:state', (data) => renderAutoApproveToggle(data.enabled));
     socket.on('tailscale:register_pending', (data) => { addPendingRegister(data); showToast('info', \`🛡️ Tailscale register request masuk\`); });
     socket.on('tailscale:register_completed', (data) => removePendingRegister(data.auth_id));
     socket.on('tailscale:auto_register', (data) => {
@@ -2267,6 +2456,50 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       const data = await res.json();
       renderAutoAcceptToggle(data);
     } catch (e) { console.error('loadAutoAcceptStatus', e); }
+  }
+
+  // 2026-10-29 F1: Auto-Approve toggle UI (orange/amber accent, persistent — no auto-expiry)
+  async function loadAutoApproveStatus() {
+    try {
+      const res = await fetch('/api/auto-approve/status');
+      const data = await res.json();
+      renderAutoApproveToggle(data.enabled);
+    } catch (e) { console.error('loadAutoApproveStatus', e); }
+  }
+
+  function renderAutoApproveToggle(enabled) {
+    const btn = el('aa-toggle');
+    const txt = el('aa-toggle-text');
+    const warn = el('aa-warning');
+    if (!btn || !txt || !warn) return;
+    if (enabled) {
+      btn.classList.add('on');
+      txt.textContent = 'Auto-Approve: ON';
+      warn.style.display = 'block';
+    } else {
+      btn.classList.remove('on');
+      txt.textContent = 'Auto-Approve: OFF';
+      warn.style.display = 'none';
+    }
+  }
+
+  async function toggleAutoApprove() {
+    const btn = el('aa-toggle');
+    const currentlyOn = btn.classList.contains('on');
+    const url = currentlyOn ? '/api/auto-approve/disable' : '/api/auto-approve/enable';
+    try {
+      const res = await fetch(url, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        renderAutoApproveToggle(data.enabled);
+        showToast(data.enabled ? 'warning' : 'info',
+          data.enabled ? 'Auto-Approve AKTIF — semua transaksi akan di-approve otomatis' : 'Auto-Approve dimatikan');
+      } else {
+        showToast('danger', 'Gagal toggle auto-approve: ' + (data.msg || 'unknown'));
+      }
+    } catch (e) {
+      showToast('danger', 'Error toggle auto-approve: ' + e.message);
+    }
   }
 
   function renderAutoAcceptToggle(data) {
@@ -2387,6 +2620,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   // ------- Boot -------
   refreshAll();
   loadAutoAcceptStatus();
+  loadAutoApproveStatus();  // 2026-10-29 F1
   setupSocket();
 
   // Session time display

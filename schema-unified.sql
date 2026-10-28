@@ -1,7 +1,8 @@
 -- =============================================================
 -- Schema: auto_transfer_db_unified
--- Version: v2 (unified, 2026-09-24)
+-- Version: v3 (feature-impl 2026-10-29)
 -- Merge: brimo (:3005) + mybca (:3006) → unified (:3010)
+-- Change vs v2: +app_config table, +decision_source column di transfer_validations
 -- Change vs legacy: tambah kolom `app_source` di transfer_request + transfer_validations
 -- =============================================================
 
@@ -11,6 +12,7 @@
 -- =============================================================
 -- Table: transfer_request
 -- =============================================================
+DROP TABLE IF EXISTS `app_config`;
 DROP TABLE IF EXISTS `transfer_validations`;
 DROP TABLE IF EXISTS `transfer_request`;
 
@@ -47,6 +49,7 @@ CREATE TABLE `transfer_validations` (
   `bank_name` varchar(50) DEFAULT NULL,
   `total_amount` decimal(15,2) DEFAULT NULL,
   `status` enum('WAITING','PROCEED','ABORT') DEFAULT 'WAITING',
+  `decision_source` enum('ADMIN','TIMEOUT','AUTO') DEFAULT NULL,
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`task_id`),
@@ -55,6 +58,20 @@ CREATE TABLE `transfer_validations` (
   CONSTRAINT `fk_validations_request`
     FOREIGN KEY (`task_id`) REFERENCES `transfer_request` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- =============================================================
+-- Table: app_config (generic key-value config, v3+)
+-- Current keys:
+--   - auto_approve_enabled: 'true' | 'false' (default 'false')
+-- =============================================================
+CREATE TABLE `app_config` (
+  `key` varchar(100) NOT NULL,
+  `value` varchar(500) NOT NULL,
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+INSERT INTO `app_config` (`key`, `value`) VALUES ('auto_approve_enabled', 'false');
 
 -- =============================================================
 -- Notes:
