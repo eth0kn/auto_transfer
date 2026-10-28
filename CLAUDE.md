@@ -17,7 +17,7 @@
 
 **Deploy target:** VPS `okta-prod` (13.228.167.183), Ubuntu, MySQL 8, PM2 process manager (user `robot`).
 
-**🆕 Status (2026-09-24):** Sedang **MERGE 2 backend terpisah** (brimo :3005 + mybca :3006) menjadi 1 unified backend `:3010` dengan dashboard tab per-bank. Baca `docs/MIGRATION.md`.
+**Status (2026-10-29):** Unified backend `:3010` production-ready, serving 3 bot client (brimo + mybca + seabank) via URL prefix. Legacy `:3005` + `:3006` deprecated. Latest features: **F1 Auto-Approve toggle** (global, DB-backed) + **F2 Transfer Status endpoint** — detail di `docs/feature-impl-2026-10-29.md`.
 
 ---
 
@@ -82,9 +82,36 @@ Setiap sesi baru, buka `docs/INDEX.md` untuk status terkini. Order rekomendasi b
   - Legacy: `/var/automate/brimo/auto_transfer/` + `/var/automate/mybca/auto_transfer/`
   - Unified: `/var/automate/auto_transfer/` (per user decision Q-07, 2026-09-24)
 - **Bots yang consume:**
-  - `brimoclientapp` (repo `C:\Users\KN\Documents\mygit\brimoclientapp`), current v3.3.0
-  - `mybcaclientapp` (repo `C:\Users\KN\Documents\mygit\mybcaclientapp`), current v3.3.0
-  - Bot connect ke `SERVER_API_URL` yang di-hardcode di `main.js`
+  - `brimoclientapp` (repo `C:\Users\KN\Documents\mygit\brimoclientapp`), current v3.7.0
+  - `mybcaclientapp` (repo `C:\Users\KN\Documents\mygit\mybcaclientapp`), current v3.6.0
+  - `seabankclientapp` (repo `C:\Users\KN\Documents\mygit\seabankclientapp`), current v1.0.0
+  - Bot connect ke `SERVER_API_URL` yang di-hardcode di `main.js`, format: `http://13.228.167.183:3010/{app_source}`
+
+---
+
+## 🆕 5a. Fitur Baru 2026-10-29 (F1 + F2)
+
+### F1 — Auto-Approve Global Toggle
+
+Admin dashboard bisa toggle "Auto-Approve" di header. Saat ON, semua `/{app}/validate-confirmation` request dari bot (brimo/mybca/seabank) langsung di-approve immediate (status PROCEED, decision_source=AUTO) tanpa menunggu admin manual review atau 60s timeout.
+
+- **State persistence:** DB table `app_config` (key-value). Row `auto_approve_enabled` di-load ke in-memory flag saat boot.
+- **Endpoints:** `GET/POST /api/auto-approve/status|enable|disable` (semua `requireAuth` cookie).
+- **Socket broadcast:** `auto_approve:state` event untuk sync cross-tab dashboard.
+- **Audit trail:** column `transfer_validations.decision_source` ENUM(`ADMIN`,`TIMEOUT`,`AUTO`) tracks who approved.
+- **Default state:** OFF (safe default — admin eksplisit enable).
+
+### F2 — Transfer Status Endpoint
+
+External client (bot or external integration) bisa cek status transfer by task_id.
+
+- **Endpoint:** `GET /{app}/transfer-status/:task_id` (3 instansi: /brimo, /mybca, /seabank)
+- **Auth:** `X-API-KEY` header (mirror `/transfer`)
+- **Response:** Rich 13-field JSON (status, amount, dest, bank_type, ref_number, message, validation_status, decision_source, bot_alias, timestamps)
+- **Derived status enum:** `PENDING`, `PROCESSING`, `AWAITING_VALIDATION`, `SUCCESS`, `FAILED`, `NOT_FOUND`
+- **Error:** 400 invalid format, 401 bad key, 404 not found, 500 DB error
+
+**Detail implementation + dev-test + rollback plan:** `docs/feature-impl-2026-10-29.md`.
 
 ---
 
