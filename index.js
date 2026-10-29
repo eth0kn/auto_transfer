@@ -912,6 +912,16 @@ function setupBotNamespace(app_source) {
             if (!bot_id) return console.log(`⚠️ [${app_source}] bot:register without bot_id`);
 
             const key = `${app_source}:${alias}`;
+            // v3.8.0 2026-10-29: force-disconnect old socket (defense against legacy
+            // client with 1-global-socket + multi-register pattern). Prevents orphan
+            // entries when a new socket register with same alias while old one still linger.
+            const existingSocket = botSockets.get(key);
+            if (existingSocket && existingSocket.id !== socket.id) {
+                try {
+                    existingSocket.disconnect(true);
+                    console.log(`🚪 [${app_source}] Force-disconnected old socket ${existingSocket.id} for ${alias} (replaced by ${socket.id})`);
+                } catch (_) { /* already dead */ }
+            }
             const isReRegister = botSockets.has(key);
 
             socket.bot_id = bot_id;
@@ -971,6 +981,15 @@ function setupBotNamespace(app_source) {
         socket.on('bot:unregister', ({ bot_id }) => {
             if (!bot_id || !socket.alias) return;
             const key = `${app_source}:${socket.alias}`;
+            // v3.8.0 2026-10-29: guard — hanya delete kalau socket ini masih socket aktif
+            // untuk key. Prevents accidental delete of newer socket in a force-disconnect
+            // (legacy client with multi-register pattern can trigger unregister dari socket
+            // yang sudah di-superseded).
+            const current = botSockets.get(key);
+            if (current && current.id !== socket.id) {
+                console.log(`[${app_source}] unregister from superseded socket ${socket.id} (${socket.alias}) — skip`);
+                return;
+            }
             botSockets.delete(key);
             console.log(`👋 [${app_source}] BOT UNREGISTERED: ${bot_id} ${socket.alias}`);
             io.emit('bot:status', { alias: socket.alias, app_source, online: false });
@@ -980,6 +999,12 @@ function setupBotNamespace(app_source) {
             if (!socket.bot_id) return;
             const key = `${app_source}:${socket.alias}`;
             const alias = socket.alias;
+            // v3.8.0 2026-10-29: same guard — skip kalau socket sudah di-supersede
+            const current = botSockets.get(key);
+            if (current && current.id !== socket.id) {
+                console.log(`[${app_source}] disconnect superseded socket ${socket.id} (${alias}) — skip cleanup`);
+                return;
+            }
             botSockets.delete(key);
             console.log(`🔴 [${app_source}] BOT DISCONNECTED: ${socket.bot_id} ${alias} | ${reason}`);
             io.emit('bot:status', { alias, app_source, online: false });
@@ -1055,6 +1080,26 @@ setInterval(async () => {
                 io.emit('task_completed', { task_id: r.id, status: 'FAILED', app_source: r.app_source });
             }
             console.log(`♻️ [CLEANUP] Auto-cancelled ${pendingStale.length} stale PENDING task(s) (>${pendingMin} min)`);
+        }
+
+        // 3. v3.8.0 2026-10-29: Prune stale botSockets entries (socket disconnected
+        // tapi masih di Map). Target: legacy clients yang unclean crash, atau orphan
+        // dari socket.alias overwrite pattern. Backward-compat untuk bugged clients
+        // yang belum di-refactor ke per-engine socket (brimo <v3.8.0, mybca, seabank).
+        let prunedCount = 0;
+        for (const [key, sock] of botSockets.entries()) {
+            if (!sock.connected) {
+                const idx = key.indexOf(':');
+                const app_source = key.substring(0, idx);
+                const alias = key.substring(idx + 1);
+                botSockets.delete(key);
+                io.emit('bot:status', { alias, app_source, online: false });
+                console.log(`🧹 [prune] Removed stale socket ${key} (socket.connected=false)`);
+                prunedCount++;
+            }
+        }
+        if (prunedCount > 0) {
+            console.log(`🧹 [CLEANUP] Pruned ${prunedCount} stale botSockets entries`);
         }
     } catch (e) {
         console.error('[CLEANUP ERROR]', e.message);
