@@ -247,18 +247,31 @@ function createBotRouter(app_source) {
                      WHERE task_id = ? AND app_source = ?`,
                     [d.task_id, app_source]
                 );
-                const owner = taskOwner.get(d.task_id);
-                if (owner) {
-                    emitToBot(owner.app, owner.alias, 'decision', {
-                        task_id: d.task_id, status: 'PROCEED', source: 'AUTO'
-                    });
-                } else {
-                    console.warn(`[${app_source}] [auto-approve] no taskOwner for ${d.task_id} — bot socket may be disconnected`);
-                }
-                io.emit('decision_updated', {
-                    task_id: d.task_id, status: 'PROCEED', source: 'AUTO', app_source
-                });
                 console.log(`✅ [${app_source}] [auto-approve] PROCEED ${d.task_id}`);
+                // v3.8.2 (2026-10-30): Defer socket emit via setImmediate — fix race
+                // dimana bot engine axios.post /validate-confirmation BELUM resolve saat
+                // backend sync-emit decision. Bot setup `pendingDecisions` resolver
+                // SETELAH axios resolve, jadi kalau emit sync, event drop → bot stuck
+                // wait → 180s stale cleanup FAILED. Dengan setImmediate, emit terjadi
+                // SETELAH HTTP response terserialize → bot resolver ready saat terima.
+                // Admin flow (toggle OFF) aman karena ada delay admin-click (detik-ke-menit)
+                // sudah >> race window.
+                const owner = taskOwner.get(d.task_id);
+                setImmediate(() => {
+                    if (owner) {
+                        const sent = emitToBot(owner.app, owner.alias, 'decision', {
+                            task_id: d.task_id, status: 'PROCEED', source: 'AUTO'
+                        });
+                        if (!sent) {
+                            console.warn(`[${app_source}] [auto-approve] emitToBot failed for ${d.task_id} — bot socket not registered`);
+                        }
+                    } else {
+                        console.warn(`[${app_source}] [auto-approve] no taskOwner for ${d.task_id} — bot socket may be disconnected`);
+                    }
+                    io.emit('decision_updated', {
+                        task_id: d.task_id, status: 'PROCEED', source: 'AUTO', app_source
+                    });
+                });
                 return res.json({ success: true, auto_approved: true });
             }
 
