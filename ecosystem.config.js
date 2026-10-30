@@ -8,7 +8,7 @@
 // ==========================================================
 module.exports = {
     apps: [{
-        name: 'auto_transfer',
+        name: 'unified-backend',   // match existing PM2 process name di VPS
         script: 'index.js',
         cwd: __dirname,
 
