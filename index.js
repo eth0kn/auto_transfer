@@ -41,7 +41,7 @@ const pool = mysql.createPool({
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'auto_transfer_db_unified',
     waitForConnections: true,
-    connectionLimit: 10,
+    connectionLimit: 50,
     queueLimit: 0
 });
 
@@ -216,37 +216,57 @@ function createBotRouter(app_source) {
     r.post('/validate-confirmation', async (req, res) => {
         try {
             const d = req.body;
-            await pool.execute(
-                `INSERT INTO transfer_validations
-                   (task_id, app_source, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WAITING')
-                 ON DUPLICATE KEY UPDATE
-                   status = 'WAITING',
-                   target_name_extracted = VALUES(target_name_extracted),
-                   target_rek_extracted = VALUES(target_rek_extracted),
-                   bank_name = VALUES(bank_name),
-                   total_amount = VALUES(total_amount),
-                   updated_at = NOW()`,
-                [d.task_id, app_source, d.device_id, d.account_name,
-                 d.account_name_extracted, d.account_number_extracted,
-                 d.bank_name, d.total_amount]
-            );
 
-            const [reqData] = await pool.execute(
-                `SELECT amount, dest FROM transfer_request WHERE id = ? AND app_source = ?`,
-                [d.task_id, app_source]
-            );
+            // R8 (2026-10-30): Transaction wrapper INSERT WAITING + conditional UPDATE PROCEED.
+            // Pre-fix: 2 separate pool.execute() — kalau MySQL crash atau connection drop
+            // antara INSERT & UPDATE di auto-approve path, bisa partial state (stuck WAITING).
+            // Scope transaction: INSERT + SELECT reqData + conditional UPDATE (auto-approve only).
+            // Emit socket moved OUTSIDE transaction (post-commit) karena side-effect non-DB.
+            const conn = await pool.getConnection();
+            let reqData;
+            let autoApproved = false;
+            try {
+                await conn.beginTransaction();
+                await conn.execute(
+                    `INSERT INTO transfer_validations
+                       (task_id, app_source, device_id, account_name, target_name_extracted, target_rek_extracted, bank_name, total_amount, status)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WAITING')
+                     ON DUPLICATE KEY UPDATE
+                       status = 'WAITING',
+                       target_name_extracted = VALUES(target_name_extracted),
+                       target_rek_extracted = VALUES(target_rek_extracted),
+                       bank_name = VALUES(bank_name),
+                       total_amount = VALUES(total_amount),
+                       updated_at = NOW()`,
+                    [d.task_id, app_source, d.device_id, d.account_name,
+                     d.account_name_extracted, d.account_number_extracted,
+                     d.bank_name, d.total_amount]
+                );
+                [reqData] = await conn.execute(
+                    `SELECT amount, dest FROM transfer_request WHERE id = ? AND app_source = ?`,
+                    [d.task_id, app_source]
+                );
+                if (autoApprovalEnabled) {
+                    await conn.execute(
+                        `UPDATE transfer_validations SET status = 'PROCEED', decision_source = 'AUTO'
+                         WHERE task_id = ? AND app_source = ?`,
+                        [d.task_id, app_source]
+                    );
+                    autoApproved = true;
+                }
+                await conn.commit();
+            } catch (txErr) {
+                await conn.rollback();
+                throw txErr;
+            } finally {
+                conn.release();
+            }
 
             // F1 (2026-10-29): Auto-approve short-circuit.
             // If global toggle ON: immediately mark PROCEED + emit decision to bot + emit
             // decision_updated to dashboard, and SKIP timeout registration. Bot gets its
             // decision in <500ms instead of waiting for admin or 60s timeout.
-            if (autoApprovalEnabled) {
-                await pool.execute(
-                    `UPDATE transfer_validations SET status = 'PROCEED', decision_source = 'AUTO'
-                     WHERE task_id = ? AND app_source = ?`,
-                    [d.task_id, app_source]
-                );
+            if (autoApproved) {
                 console.log(`✅ [${app_source}] [auto-approve] PROCEED ${d.task_id}`);
                 // v3.8.2 (2026-10-30): Defer socket emit via setImmediate — fix race
                 // dimana bot engine axios.post /validate-confirmation BELUM resolve saat
@@ -331,10 +351,17 @@ function createBotRouter(app_source) {
             const { task_id, status } = req.body;
             const msg = req.body.message || 'Rejected by Admin';
 
-            // F1 (2026-10-29): persist decision_source='ADMIN' (prefixed route is also admin-driven)
+            // R3 (2026-10-30): Detect bot internal timeout vs real admin action.
+            // Pre-fix: all prefixed POSTs tagged ADMIN. Bot timeout path (engine/bot.js) POSTs
+            // { message: 'timeout auto rejected' } — mis-labeled as admin in DB audit.
+            // Accept explicit source field (future bot change) or fallback regex on message text.
+            const rawSource = (req.body.source || '').toUpperCase();
+            const isBotTimeout = rawSource === 'TIMEOUT' || /timeout/i.test(msg);
+            const decisionSource = isBotTimeout ? 'TIMEOUT' : 'ADMIN';
+
             await pool.execute(
-                `UPDATE transfer_validations SET status = ?, decision_source = 'ADMIN' WHERE task_id = ? AND app_source = ?`,
-                [status, task_id, app_source]
+                `UPDATE transfer_validations SET status = ?, decision_source = ? WHERE task_id = ? AND app_source = ?`,
+                [status, decisionSource, task_id, app_source]
             );
             if (validationTimers.has(task_id)) {
                 clearTimeout(validationTimers.get(task_id));
@@ -343,7 +370,7 @@ function createBotRouter(app_source) {
             const owner = taskOwner.get(task_id);
             if (owner) {
                 emitToBot(owner.app, owner.alias, 'decision', {
-                    task_id, status, source: 'ADMIN'
+                    task_id, status, source: decisionSource
                 });
             }
             if (status === 'ABORT') {
@@ -441,6 +468,17 @@ app.post('/update-decision', requireAuth, async (req, res) => {
     try {
         const { task_id, status } = req.body;
         const msg = req.body.message || 'Rejected by Admin';
+
+        // R6 (2026-10-30): Admin reject gate saat auto-approve ON.
+        // Prevent admin dari click REJECT when global auto-approve is active —
+        // policy per 2026-10-30: admin tidak bisa override auto-approve policy.
+        // Approve (PROCEED) tetap allowed sebagai manual override backup.
+        if (autoApprovalEnabled && status === 'ABORT') {
+            return res.status(403).json({
+                error: 'Admin reject disabled while auto-approve is ON',
+                hint: 'Toggle auto-approve OFF via dashboard first, then reject.'
+            });
+        }
 
         // Detect app_source dari validation row
         const [rows] = await pool.execute(
@@ -1118,6 +1156,21 @@ setInterval(async () => {
         console.error('[CLEANUP ERROR]', e.message);
     }
 }, 60000);
+
+// ==========================================================
+// R5 (2026-10-30): CRASH SAFETY HANDLERS
+// Prevent 1 unhandled async throw / uncaught exception from killing
+// backend when running 30+ bot socket + concurrent transfers.
+// Log + continue (don't exit); monitor logs for recurring patterns.
+// ==========================================================
+process.on('unhandledRejection', (reason, promise) => {
+    const stack = reason instanceof Error ? reason.stack : String(reason);
+    console.error('🔥 [UNHANDLED REJECTION]', stack);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('💥 [UNCAUGHT EXCEPTION]', err.stack || err);
+});
 
 // ==========================================================
 // SERVER START
