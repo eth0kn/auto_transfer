@@ -17,6 +17,9 @@ module.exports = {
         env: {
             NODE_ENV: 'production',
             TZ: 'Asia/Jakarta',
+            // OBS (2026-10-31): observability bundle for race investigation.
+            // Set '1' to enable [OBS-BE] verbose logs. Flip to '0' or remove to disable.
+            OBS_VERBOSE: '1',
         },
 
         // PM2 prepends this to every log line. moment() format pattern.

@@ -27,6 +27,9 @@ const VALIDATION_TIMEOUT_MS = parseInt(process.env.VALIDATION_TIMEOUT_MS) || 600
 const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 180000;
 const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 10 * 60 * 1000; // 10 min
 const LEGACY_UNPREFIXED = process.env.LEGACY_UNPREFIXED_ROUTES === 'true';
+// OBS (2026-10-31): observability bundle toggle. Set `OBS_VERBOSE=1` di env (ecosystem.config.js)
+// untuk enable verbose logging race investigation. Default OFF di prod. Zero behavior change.
+const OBS_VERBOSE = process.env.OBS_VERBOSE === '1' || process.env.OBS_VERBOSE === 'true';
 
 // ==========================================================
 // APP + DB + IO
@@ -71,9 +74,25 @@ app.use(cookieParser());
 // ==========================================================
 function emitToBot(app_source, alias, event, payload) {
     const sock = botSockets.get(`${app_source}:${alias}`);
-    if (!sock) return false;
+    if (!sock) {
+        if (OBS_VERBOSE) {
+            console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} FAIL=no_socket ts_ms=${Date.now()}`);
+        }
+        return false;
+    }
+    if (OBS_VERBOSE) {
+        console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} socket_id=${sock.id} connected=${sock.connected} ts_ms=${Date.now()} task_id=${payload && payload.task_id || '-'}`);
+    }
     sock.emit(event, payload);
     return true;
+}
+
+// OBS helper: terse structured log, auto-skip kalau OBS_VERBOSE off.
+function obsLog(marker, data) {
+    if (!OBS_VERBOSE) return;
+    const parts = [`[OBS-BE] ${marker}`, `ts_ms=${Date.now()}`];
+    for (const [k, v] of Object.entries(data || {})) parts.push(`${k}=${v}`);
+    console.log(parts.join(' '));
 }
 
 function generateTrxId() {
@@ -214,8 +233,10 @@ function createBotRouter(app_source) {
 
     // D. Bot validation request — /{app}/validate-confirmation
     r.post('/validate-confirmation', async (req, res) => {
+        const _obsStart = Date.now();
         try {
             const d = req.body;
+            obsLog('VC-ENTRY', { app: app_source, task_id: d && d.task_id, device: d && d.device_id, amount: d && d.total_amount });
 
             // R8 (2026-10-30): Transaction wrapper INSERT WAITING + conditional UPDATE PROCEED.
             // Pre-fix: 2 separate pool.execute() — kalau MySQL crash atau connection drop
@@ -261,6 +282,7 @@ function createBotRouter(app_source) {
             } finally {
                 conn.release();
             }
+            obsLog('VC-TX-COMMIT', { app: app_source, task_id: d.task_id, autoApproved, tx_duration_ms: Date.now() - _obsStart });
 
             // F1 (2026-10-29): Auto-approve short-circuit.
             // If global toggle ON: immediately mark PROCEED + emit decision to bot + emit
@@ -277,7 +299,10 @@ function createBotRouter(app_source) {
                 // Admin flow (toggle OFF) aman karena ada delay admin-click (detik-ke-menit)
                 // sudah >> race window.
                 const owner = taskOwner.get(d.task_id);
+                obsLog('VC-SI-SCHEDULE', { app: app_source, task_id: d.task_id, owner_alias: owner && owner.alias || 'null' });
+                const _siScheduledAt = Date.now();
                 setImmediate(() => {
+                    obsLog('VC-SI-FIRE', { app: app_source, task_id: d.task_id, delta_ms: Date.now() - _siScheduledAt });
                     if (owner) {
                         const sent = emitToBot(owner.app, owner.alias, 'decision', {
                             task_id: d.task_id, status: 'PROCEED', source: 'AUTO'
@@ -292,6 +317,7 @@ function createBotRouter(app_source) {
                         task_id: d.task_id, status: 'PROCEED', source: 'AUTO', app_source
                     });
                 });
+                obsLog('VC-RESJSON', { app: app_source, task_id: d.task_id, total_duration_ms: Date.now() - _obsStart });
                 return res.json({ success: true, auto_approved: true });
             }
 
