@@ -26,6 +26,10 @@ const PORT = parseInt(process.env.PORT) || 3010;
 const VALIDATION_TIMEOUT_MS = parseInt(process.env.VALIDATION_TIMEOUT_MS) || 60000;
 const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 180000;
 const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 10 * 60 * 1000; // 10 min
+// v4.0.0 ACK-P2 (2026-10-31): per-alias dispatcher back-pressure.
+// Backend emits task:new ONE AT A TIME per bot alias; next emit waits for ACK.
+// Prevents 10-task burst → 10-ACK-same-timestamp → PROCESSING_STALE_MS false timeout.
+const DISPATCH_ACK_TIMEOUT_MS = parseInt(process.env.DISPATCH_ACK_TIMEOUT_MS) || 60000; // Q1 A1: 60s
 const LEGACY_UNPREFIXED = process.env.LEGACY_UNPREFIXED_ROUTES === 'true';
 // OBS (2026-10-31): observability bundle toggle. Set `OBS_VERBOSE=1` di env (ecosystem.config.js)
 // untuk enable verbose logging race investigation. Default OFF di prod. Zero behavior change.
@@ -85,6 +89,112 @@ function emitToBot(app_source, alias, event, payload) {
     }
     sock.emit(event, payload);
     return true;
+}
+
+// ==========================================================
+// v4.0.0 ACK-P2: SERIAL DISPATCHER PER-ALIAS
+// ==========================================================
+// Problem solved: previously backend fired all PENDING tasks in a for-loop
+// (bot:register backlog) → bot ACKs 10× instantly on-receive → backend set
+// 10 rows PROCESSING+updated_at=NOW() with same timestamp → cleanup killed
+// tasks 7+ as stale before bot even started processing them.
+//
+// New model: dispatcher per-alias is single-slot. Only emit task:new when
+// slot free; next emit happens after task:ack received (slot freed).
+// Combined with ACK-P1 bot-side (ACK at dequeue, not receive), the backend
+// updated_at anchor reflects REAL processing start.
+//
+// Recovery (Q2 B1): if no ACK within DISPATCH_ACK_TIMEOUT_MS, assume stuck
+// (bot crash / socket drop); free slot + pull next PENDING. Task row stays
+// PENDING (never transitioned PROCESSING at DB) → safe re-dispatch.
+// If late ACK arrives, UPDATE WHERE status='PENDING' guard prevents double-
+// transition.
+//
+// Scope: all app_sources (brimo, mybca, seabank) use same dispatcher.
+// Key: `${app_source}:${alias}` isolates per-bot state.
+const dispatchers = new Map(); // key -> { busyWithTaskId, ackTimeoutHandle, dispatchedAt }
+
+function dispatcherKey(appSource, alias) {
+    return `${appSource}:${alias}`;
+}
+
+function isDispatcherFree(appSource, alias) {
+    const d = dispatchers.get(dispatcherKey(appSource, alias));
+    return !d || !d.busyWithTaskId;
+}
+
+function clearDispatcherState(appSource, alias) {
+    const key = dispatcherKey(appSource, alias);
+    const d = dispatchers.get(key);
+    if (d && d.ackTimeoutHandle) {
+        clearTimeout(d.ackTimeoutHandle);
+    }
+    dispatchers.delete(key);
+}
+
+function markDispatched(appSource, alias, taskId) {
+    const key = dispatcherKey(appSource, alias);
+    clearDispatcherState(appSource, alias); // defensive: clear any leftover
+    const ackTimeoutHandle = setTimeout(() => {
+        handleAckTimeout(appSource, alias, taskId).catch(e =>
+            console.error(`[${appSource}] handleAckTimeout fatal:`, e.message)
+        );
+    }, DISPATCH_ACK_TIMEOUT_MS);
+    dispatchers.set(key, { busyWithTaskId: taskId, ackTimeoutHandle, dispatchedAt: Date.now() });
+}
+
+// Pull next PENDING task for this alias + emit. Returns dispatched task_id or null.
+// NOP if dispatcher busy or no PENDING. Idempotent across callers.
+async function pullAndDispatchNext(appSource, alias) {
+    if (!isDispatcherFree(appSource, alias)) {
+        return null;
+    }
+    try {
+        const [rows] = await pool.execute(
+            `SELECT id, bank_type, dest, amount, pin, bot_alias
+             FROM transfer_request
+             WHERE app_source = ? AND bot_alias = ? AND status = 'PENDING'
+             ORDER BY created_at ASC LIMIT 1`,
+            [appSource, alias]
+        );
+        if (rows.length === 0) return null;
+        const task = rows[0];
+        const dispatched = emitToBot(appSource, alias, 'task:new', {
+            task_id: task.id,
+            bank_type: task.bank_type,
+            destination: task.dest,
+            amount: parseFloat(task.amount),
+            pin: task.pin,
+            alias: task.bot_alias
+        });
+        if (dispatched) {
+            markDispatched(appSource, alias, task.id);
+            taskOwner.set(task.id, { app: appSource, alias });
+            console.log(`[${appSource}] [SERIAL DISPATCH] ${task.id} -> ${alias} (dispatcher busy, ACK timeout in ${DISPATCH_ACK_TIMEOUT_MS/1000}s)`);
+            return task.id;
+        }
+        // Bot socket not registered — leave as PENDING, dispatcher free, next bot:register triggers pull
+        return null;
+    } catch (e) {
+        console.error(`[${appSource}] pullAndDispatchNext error:`, e.message);
+        return null;
+    }
+}
+
+// Q2 B1 recovery: on ACK timeout, free dispatcher + attempt re-dispatch.
+// Task row stays PENDING (never transitioned PROCESSING yet). Next pull picks it up.
+// If late ACK arrives, UPDATE WHERE status='PENDING' guard still works (safe).
+async function handleAckTimeout(appSource, alias, taskId) {
+    console.warn(`[${appSource}] [ACK TIMEOUT ${DISPATCH_ACK_TIMEOUT_MS/1000}s] task ${taskId} alias ${alias} — reset dispatcher + re-dispatch`);
+    clearDispatcherState(appSource, alias);
+    // Pull next PENDING (which may still be the same task_id if nothing newer arrived)
+    await pullAndDispatchNext(appSource, alias);
+}
+
+// Free dispatcher slot on ACK + pull next PENDING. Called from task:ack handler.
+async function freeDispatcherAndPullNext(appSource, alias) {
+    clearDispatcherState(appSource, alias);
+    await pullAndDispatchNext(appSource, alias);
 }
 
 // OBS helper: terse structured log, auto-skip kalau OBS_VERBOSE off.
@@ -158,17 +268,19 @@ function createBotRouter(app_source) {
                 [newTaskId, app_source, alias, bank || 'BRI', dest, amount, pin]
             );
 
-            const dispatched = emitToBot(app_source, alias, 'task:new', {
-                task_id: newTaskId,
-                bank_type: bank || 'BRI',
-                destination: dest,
-                amount: parseFloat(amount),
-                pin,
-                alias
-            });
-            if (dispatched) {
-                taskOwner.set(newTaskId, { app: app_source, alias });
-                console.log(`[${app_source}] [SOCKET EMIT] Task ${newTaskId} -> ${alias}`);
+            // v4.0.0 ACK-P2: route through serial dispatcher (D1 scope — all emit paths).
+            // If dispatcher free for this alias → emit immediately. If busy → task stays
+            // PENDING, picked up when current task ACKs (freeDispatcherAndPullNext).
+            if (isDispatcherFree(app_source, alias)) {
+                const dispatchedTaskId = await pullAndDispatchNext(app_source, alias);
+                if (dispatchedTaskId === newTaskId) {
+                    console.log(`[${app_source}] [SERIAL EMIT] ${newTaskId} -> ${alias} (dispatcher was free)`);
+                } else if (dispatchedTaskId) {
+                    // Rare: another older PENDING was picked up first (ordered by created_at).
+                    console.log(`[${app_source}] [SERIAL EMIT] older PENDING ${dispatchedTaskId} picked -> ${alias}; ${newTaskId} stays PENDING`);
+                }
+            } else {
+                console.log(`[${app_source}] [DISPATCH DEFERRED] ${newTaskId} queued PENDING; dispatcher busy for ${alias}`);
             }
 
             // Dashboard realtime — task masuk queue
@@ -1015,25 +1127,23 @@ function setupBotNamespace(app_source) {
             }
             io.emit('bot:status', { alias, app_source, device_id, online: true, connected_at: socket.connected_at });
 
-            // Backlog dispatch — pending tasks yang belum di-execute
+            // v4.0.0 ACK-P2: backlog dispatch via serial dispatcher (replaces for-loop burst).
+            // On bot reconnect, clear any stale dispatcher state + pull SINGLE next PENDING.
+            // Chain continues on each ACK (freeDispatcherAndPullNext in task:ack handler).
             try {
-                const [rows] = await pool.execute(
-                    `SELECT * FROM transfer_request
-                     WHERE app_source = ? AND bot_alias = ? AND status = 'PENDING'
-                     ORDER BY created_at ASC`,
+                clearDispatcherState(app_source, alias); // fresh slate on bot:register
+                const [countRows] = await pool.execute(
+                    `SELECT COUNT(*) as cnt FROM transfer_request
+                     WHERE app_source = ? AND bot_alias = ? AND status = 'PENDING'`,
                     [app_source, alias]
                 );
-                for (const task of rows) {
-                    socket.emit('task:new', {
-                        task_id: task.id,
-                        bank_type: task.bank_type,
-                        destination: task.dest,
-                        amount: parseFloat(task.amount),
-                        pin: task.pin,
-                        alias: task.bot_alias
-                    });
-                    taskOwner.set(task.id, { app: app_source, alias });
-                    console.log(`[${app_source}] [BACKLOG DISPATCH] ${task.id} -> ${alias}`);
+                const pendingCount = countRows[0].cnt;
+                if (pendingCount > 0) {
+                    console.log(`[${app_source}] [BACKLOG] ${alias} has ${pendingCount} PENDING — serial dispatch starting`);
+                    const firstTaskId = await pullAndDispatchNext(app_source, alias);
+                    if (firstTaskId) {
+                        console.log(`[${app_source}] [BACKLOG] first task ${firstTaskId} dispatched; remaining ${pendingCount - 1} will chain via ACK`);
+                    }
                 }
             } catch (e) {
                 console.error(`[${app_source}] Backlog dispatch error:`, e.message);
@@ -1048,8 +1158,11 @@ function setupBotNamespace(app_source) {
                      WHERE id = ? AND status = 'PENDING' AND bot_alias = ? AND app_source = ?`,
                     [task_id, socket.alias, app_source]
                 );
-                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id}`);
+                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id} (at dequeue, v4.0.0)`);
                 io.emit('task_ack', { task_id, app_source, alias: socket.alias });
+                // v4.0.0 ACK-P2: free dispatcher slot + pull next PENDING for this alias.
+                // This chains the serial dispatch across backlog without for-loop burst.
+                await freeDispatcherAndPullNext(app_source, socket.alias);
             } catch (e) {
                 console.error(`[${app_source}] [ACK ERROR] ${task_id}`, e.message);
             }
