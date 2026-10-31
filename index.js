@@ -24,7 +24,10 @@ const { execFile, spawn } = require('child_process');
 const APP_SOURCES = ['brimo', 'mybca', 'seabank'];
 const PORT = parseInt(process.env.PORT) || 3010;
 const VALIDATION_TIMEOUT_MS = parseInt(process.env.VALIDATION_TIMEOUT_MS) || 60000;
-const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 180000;
+// v4.0.1 M2 (2026-11-01): raised from 180s → 300s. 180s was too tight untuk slow
+// network transfer saat scale 150 trx / 30 bots serial — causes SUCCESS stamp onto
+// FAILED row race. 300s = 5min safety window, still catches true stuck/crashed bot.
+const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 300000;
 const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 10 * 60 * 1000; // 10 min
 // v4.0.0 ACK-P2 (2026-10-31): per-alias dispatcher back-pressure.
 // Backend emits task:new ONE AT A TIME per bot alias; next emit waits for ACK.
@@ -149,6 +152,13 @@ async function pullAndDispatchNext(appSource, alias) {
     if (!isDispatcherFree(appSource, alias)) {
         return null;
     }
+    // v4.0.1 F3 (2026-11-01): reserve dispatcher slot SYNCHRONOUSLY before DB await,
+    // so concurrent callers see isDispatcherFree=false. Prevents double-emit race
+    // where 2 simultaneous POST /transfer both pass free-check + both SELECT same
+    // oldest PENDING → bot receives duplicate task:new (bot dedup catches, but
+    // defeats serial contract + wastes socket I/O).
+    const _resKey = dispatcherKey(appSource, alias);
+    dispatchers.set(_resKey, { busyWithTaskId: '__RESERVED__', ackTimeoutHandle: null, dispatchedAt: Date.now() });
     try {
         const [rows] = await pool.execute(
             `SELECT id, bank_type, dest, amount, pin, bot_alias
@@ -157,7 +167,11 @@ async function pullAndDispatchNext(appSource, alias) {
              ORDER BY created_at ASC LIMIT 1`,
             [appSource, alias]
         );
-        if (rows.length === 0) return null;
+        if (rows.length === 0) {
+            // Release reservation — no task to dispatch
+            dispatchers.delete(_resKey);
+            return null;
+        }
         const task = rows[0];
         const dispatched = emitToBot(appSource, alias, 'task:new', {
             task_id: task.id,
@@ -173,9 +187,12 @@ async function pullAndDispatchNext(appSource, alias) {
             console.log(`[${appSource}] [SERIAL DISPATCH] ${task.id} -> ${alias} (dispatcher busy, ACK timeout in ${DISPATCH_ACK_TIMEOUT_MS/1000}s)`);
             return task.id;
         }
-        // Bot socket not registered — leave as PENDING, dispatcher free, next bot:register triggers pull
+        // Bot socket not registered — leave as PENDING, release reservation, next bot:register triggers pull
+        dispatchers.delete(_resKey);
         return null;
     } catch (e) {
+        // Release reservation on any error — don't leak reserved slot
+        dispatchers.delete(_resKey);
         console.error(`[${appSource}] pullAndDispatchNext error:`, e.message);
         return null;
     }
@@ -292,7 +309,7 @@ function createBotRouter(app_source) {
                 bank_type: bank || 'BRI',
                 dest,
                 amount: parseFloat(amount),
-                status: dispatched ? 'PENDING' : 'PENDING',
+                status: 'PENDING',  // v4.0.1 F1 (2026-11-01): removed broken `dispatched ?` ternary (var was deleted in ACK-P2 refactor, caused ReferenceError → every POST /transfer 500)
                 created_at: new Date().toISOString()
             });
 
@@ -328,6 +345,13 @@ function createBotRouter(app_source) {
             const finalMessage = msgObj?.text || msgObj?.reason || '';
             const refNumber = msgObj?.ref_number || null;
 
+            // v4.0.1 M1/S1 cross-fix (2026-11-01): capture bot_alias for dispatcher free call.
+            const [rows] = await pool.execute(
+                `SELECT bot_alias FROM transfer_request WHERE id = ? AND app_source = ?`,
+                [task_id, app_source]
+            );
+            const bot_alias = rows[0]?.bot_alias;
+
             await pool.execute(
                 `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW()
                  WHERE id = ? AND app_source = ?`,
@@ -336,6 +360,16 @@ function createBotRouter(app_source) {
             taskOwner.delete(task_id);
             io.emit('task_completed', { task_id, status, app_source });
             console.log(`[${app_source}] [REPORT] Task ${task_id} -> ${status}`);
+
+            // v4.0.1 M1/S1 cross-fix: result event ALSO frees dispatcher.
+            // Previously only task:ack freed slot. Reject-paths at clientapp (amount<min
+            // di mybca + seabank) call /update-task FAILED WITHOUT task:ack → dispatcher
+            // stuck 60s DISPATCH_ACK_TIMEOUT_MS per reject. Now result event belt-and-
+            // suspenders frees dispatcher immediately regardless of ACK path.
+            if (bot_alias) {
+                await freeDispatcherAndPullNext(app_source, bot_alias);
+            }
+
             res.json({ success: true });
         } catch (err) {
             console.error(`[${app_source}] [UPDATE-TASK ERROR]`, err.message);
@@ -1152,16 +1186,23 @@ function setupBotNamespace(app_source) {
 
         socket.on('task:ack', async ({ task_id }) => {
             try {
-                await pool.execute(
+                // v4.0.1 F4 (2026-11-01): capture affectedRows to gate dispatcher free.
+                // Prevents bogus/spoofed ACK from freeing dispatcher that was legitimately
+                // busy with other task → re-emit chain gets confused.
+                const [result] = await pool.execute(
                     `UPDATE transfer_request
                      SET status = 'PROCESSING', updated_at = NOW()
                      WHERE id = ? AND status = 'PENDING' AND bot_alias = ? AND app_source = ?`,
                     [task_id, socket.alias, app_source]
                 );
-                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id} (at dequeue, v4.0.0)`);
+                if (result.affectedRows === 0) {
+                    console.warn(`[${app_source}] [ACK IGNORED] task ${task_id} from ${socket.alias} — no matching PENDING row (spoofed/stale ACK?)`);
+                    return;
+                }
+                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id} (at dequeue, v4.0.1)`);
                 io.emit('task_ack', { task_id, app_source, alias: socket.alias });
                 // v4.0.0 ACK-P2: free dispatcher slot + pull next PENDING for this alias.
-                // This chains the serial dispatch across backlog without for-loop burst.
+                // Gated by F4 affectedRows check above.
                 await freeDispatcherAndPullNext(app_source, socket.alias);
             } catch (e) {
                 console.error(`[${app_source}] [ACK ERROR] ${task_id}`, e.message);
@@ -1180,6 +1221,9 @@ function setupBotNamespace(app_source) {
                 console.log(`[${app_source}] unregister from superseded socket ${socket.id} (${socket.alias}) — skip`);
                 return;
             }
+            // v4.0.1 F2 (2026-11-01): clear dispatcher state so new tasks for this alias
+            // don't silent-block waiting for 60s ACK timeout to recover from stale lock.
+            clearDispatcherState(app_source, socket.alias);
             botSockets.delete(key);
             console.log(`👋 [${app_source}] BOT UNREGISTERED: ${bot_id} ${socket.alias}`);
             io.emit('bot:status', { alias: socket.alias, app_source, online: false });
@@ -1195,6 +1239,9 @@ function setupBotNamespace(app_source) {
                 console.log(`[${app_source}] disconnect superseded socket ${socket.id} (${alias}) — skip cleanup`);
                 return;
             }
+            // v4.0.1 F2 (2026-11-01): clear dispatcher state. Prevents 60s window where
+            // POST /transfer same alias sees busy dispatcher + silent PENDING queue.
+            clearDispatcherState(app_source, alias);
             botSockets.delete(key);
             console.log(`🔴 [${app_source}] BOT DISCONNECTED: ${socket.bot_id} ${alias} | ${reason}`);
             io.emit('bot:status', { alias, app_source, online: false });
