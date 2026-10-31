@@ -361,13 +361,16 @@ function createBotRouter(app_source) {
             );
             const bot_alias = rows[0]?.bot_alias;
 
-            // v4.0.2 W2/V2-F10 (2026-11-01): UPDATE guard WHERE status='PROCESSING' + affectedRows
-            // check. Prevents double-POST race → dispatcher double-free. Parity dengan F4 ACK gate.
-            // Non-PROCESSING state (SUCCESS/FAILED already stamped) → affectedRows=0 → skip dispatcher
-            // free. Normal first-POST hits PROCESSING → affectedRows=1 → proceed.
+            // v4.0.2 W2+W6/V2-F10 (2026-11-01): UPDATE guard WHERE status IN ('PENDING', 'PROCESSING').
+            // W2 original: WHERE status='PROCESSING' — but blocked reject-path flow (bot rejects
+            // immediately at onTaskNew, never ACKs → status stays PENDING → W2 UPDATE fails →
+            // dispatcher stuck 60s → infinite retry loop). W6 revision: allow transition from
+            // EITHER non-terminal state. Only blocks genuine duplicate reports where status
+            // already terminal (SUCCESS/FAILED). Parity concept dengan F4 (prevent double-free)
+            // tapi preserve M1/S1 cross-fix untuk reject-path.
             const [updResult] = await pool.execute(
                 `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW()
-                 WHERE id = ? AND app_source = ? AND status = 'PROCESSING'`,
+                 WHERE id = ? AND app_source = ? AND status IN ('PENDING', 'PROCESSING')`,
                 [status, finalMessage, refNumber, task_id, app_source]
             );
             if (updResult.affectedRows === 0) {
