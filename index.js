@@ -129,9 +129,18 @@ function isDispatcherFree(appSource, alias) {
 function clearDispatcherState(appSource, alias) {
     const key = dispatcherKey(appSource, alias);
     const d = dispatchers.get(key);
-    if (d && d.ackTimeoutHandle) {
-        clearTimeout(d.ackTimeoutHandle);
+    if (!d) return;
+    // v4.0.2 W3/V2-F8 (2026-11-01): preserve in-flight __RESERVED__ reservations.
+    // Only pullAndDispatchNext owns __RESERVED__ state (reserved sync before DB SELECT).
+    // Self-managed cleanup via its own error/success paths. External clearers (ACK handler
+    // freeDispatcherAndPullNext, bot:disconnect, bot:unregister, markDispatched defensive
+    // clear) MUST NOT wipe reservations — would allow concurrent pullAndDispatchNext to
+    // overwrite + double-emit same oldest PENDING.
+    if (d.busyWithTaskId === '__RESERVED__') {
+        console.log(`[${appSource}] [DISPATCHER] clear skipped for ${alias} — __RESERVED__ in flight (preserving concurrent reservation)`);
+        return;
     }
+    if (d.ackTimeoutHandle) clearTimeout(d.ackTimeoutHandle);
     dispatchers.delete(key);
 }
 
@@ -352,22 +361,40 @@ function createBotRouter(app_source) {
             );
             const bot_alias = rows[0]?.bot_alias;
 
-            await pool.execute(
+            // v4.0.2 W2/V2-F10 (2026-11-01): UPDATE guard WHERE status='PROCESSING' + affectedRows
+            // check. Prevents double-POST race → dispatcher double-free. Parity dengan F4 ACK gate.
+            // Non-PROCESSING state (SUCCESS/FAILED already stamped) → affectedRows=0 → skip dispatcher
+            // free. Normal first-POST hits PROCESSING → affectedRows=1 → proceed.
+            const [updResult] = await pool.execute(
                 `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW()
-                 WHERE id = ? AND app_source = ?`,
+                 WHERE id = ? AND app_source = ? AND status = 'PROCESSING'`,
                 [status, finalMessage, refNumber, task_id, app_source]
             );
+            if (updResult.affectedRows === 0) {
+                console.warn(`[${app_source}] [UPDATE-TASK IGNORED] task ${task_id} status=${status} — no matching PROCESSING row (double-POST race or stale report)`);
+                return res.json({ success: true, ignored: true });
+            }
             taskOwner.delete(task_id);
             io.emit('task_completed', { task_id, status, app_source });
             console.log(`[${app_source}] [REPORT] Task ${task_id} -> ${status}`);
 
-            // v4.0.1 M1/S1 cross-fix: result event ALSO frees dispatcher.
-            // Previously only task:ack freed slot. Reject-paths at clientapp (amount<min
-            // di mybca + seabank) call /update-task FAILED WITHOUT task:ack → dispatcher
-            // stuck 60s DISPATCH_ACK_TIMEOUT_MS per reject. Now result event belt-and-
-            // suspenders frees dispatcher immediately regardless of ACK path.
+            // v4.0.2 W1/V2-F7 (2026-11-01): CRITICAL regression fix.
+            // Pre-fix v4.0.1 M1/S1 cross-fix unconditionally called freeDispatcher di setiap
+            // /update-task → di happy path (ACK → emit next → result arrives late) →
+            // dispatcher sudah busy dengan NEXT task → unconditional free wipes NEXT task
+            // state → re-emits NEXT task → bot dedup catches tapi serial contract broken.
+            //
+            // Fix: Gate on dispatcher.busyWithTaskId === task_id. Only free kalau dispatcher
+            // ACTUALLY busy dengan task INI. Happy path: busy with NEXT ≠ this task → NO-OP.
+            // Reject path: busy with rejected task === this task → free + pull next (M1/S1 preserved).
             if (bot_alias) {
-                await freeDispatcherAndPullNext(app_source, bot_alias);
+                const _dstate = dispatchers.get(dispatcherKey(app_source, bot_alias));
+                if (_dstate && _dstate.busyWithTaskId === task_id) {
+                    console.log(`[${app_source}] [UPDATE-TASK] dispatcher busy with THIS task ${task_id} — freeing + pulling next (reject-path or stale ACK scenario)`);
+                    await freeDispatcherAndPullNext(app_source, bot_alias);
+                }
+                // else: dispatcher busy with OTHER task (happy path post-ACK). No-op. Already correctly
+                // pointed at NEXT task by ACK handler. Result event just records outcome in DB.
             }
 
             res.json({ success: true });
