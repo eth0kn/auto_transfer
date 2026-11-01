@@ -29,6 +29,7 @@
 4. **Docs sebagai memory.** Setiap keputusan arsitektur, endpoint change, migration step — WAJIB catat di `docs/`. Jangan biarkan decision hanya hidup di conversation.
 5. **Deployment butuh explicit approval.** File `.env` di VPS harus di-review. `pm2 restart` di VPS harus dikonfirmasi user dulu.
 6. **Blue-green dulu, big-bang belakangan.** Kalau ada migration (misal port 3005 → 3010), jalankan parallel dulu, verifikasi, baru matikan yang lama.
+7. **Post-fix mini-scan mandatory (G1).** Setiap apply fix dari vulnerability/audit scan WAJIB diikuti mini-scan secondary (sub-agent fork) yang audit code **POST-fix** (bukan pre-fix) dalam konteks downstream flow — **SEBELUM commit + deploy ke VPS**, bukan setelah user report. Scope minimum: simulate end-to-end 2-3 scenarios (happy-path + reject-path + double-trigger/concurrency kalau applicable). Rationale: fix inisial sering overshoot/undershoot — scan pre-fix audit code lama, fix diterapkan, tapi fix itu sendiri intro regresi yang tidak terlihat sampai scan ulang atau worst-case prod incident. Historis konkret: v4.0.2 W1 cross-fix unconditionally wipe dispatcher state di happy-path → V2-F7 CRITICAL regression (W1 revision gate `busyWithTaskId === task_id` solve). Mini-scan W5 pada 2026-11-01 prevented W2 regression dari lolos ke prod — proof concept effective.
 
 ---
 
