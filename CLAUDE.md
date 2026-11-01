@@ -116,6 +116,53 @@ External client (bot or external integration) bisa cek status transfer by task_i
 
 ---
 
+## 🆕 5b. Fitur Baru 2026-11-02 (v4.1.0 — Transfer Status Callback)
+
+### Konsep
+
+API caller boleh ikutkan `callback_url` + `callback_secret` opsional di `POST /{app}/transfer`. Setelah transfer selesai (SUCCESS/FAILED/CANCELLED), backend POST **payload status + saldo akhir** ke `callback_url` lewat worker queue async — di luar critical path dispatcher.
+
+### Komponen Baru
+
+- **`callback-security.js`** — SSRF validator (private IP, metadata IP, CGNAT 100.64/10, IPv6 lokal, hostname blocklist, DNS lookup) + HMAC-SHA256 payload signer + delivery_id UUID generator + secret length validator (16-128 chars). Dipakai 2 titik: create-time (`POST /transfer`) + delivery-time (worker DNS poison guard).
+- **`callback-worker.js`** — DB-backed queue + tick worker. Interval 10s default (`CALLBACK_WORKER_INTERVAL_MS`), batch 20 (`CALLBACK_WORKER_BATCH`), timeout 10s per request (`CALLBACK_TIMEOUT_MS`). Exponential backoff `[30s, 2m, 10m, 1h]` ±25% jitter. 4xx → DEAD immediate, 5xx/timeout/net → retry up to 5 attempts atau 24h age. Graceful shutdown SIGTERM/SIGINT. Admin helpers: `getStats`, `listDead`, `replayTask`.
+- **DB migration** `migrations/2026-11-01_add_callback_fields.sql` — 10 kolom tambah di `transfer_request` (balance_after, balance_source, callback_url/secret/status/attempts/last_error/next_attempt_at/last_attempt_at/delivered_at) + index `idx_callback_pending`. Blue-green safe additive.
+- **`index.js` 6 edits** — require callback modules + ADMIN_API_KEY const + requireAdminKey middleware + POST /{app}/transfer accept + validate callback field + POST /update-task accept balance_after/balance_source + atomic transactional outbox UPDATE (status+callback_status NONE→PENDING satu statement) + signalPickup fire-and-forget AFTER res.json + 3 admin endpoints + SIGTERM graceful shutdown + worker start on server.listen.
+
+### Semantics
+
+- **At-least-once delivery** dengan task_id sebagai dedupe key — receiver WAJIB idempotent per task_id (karena HTTP semantic: 2xx = DELIVERED, 4xx = DEAD, 5xx + timeout + net error = retry → receiver mungkin terima dupe).
+- **Transactional outbox** — status finalize + callback enqueue di 1 UPDATE statement, zero race.
+- **Fire-and-forget** — `signalPickup()` setelah `res.json({success:true})`, dispatcher critical section unaffected oleh callback latency.
+- **HMAC-SHA256 header** `X-Callback-Signature: sha256=<hex>` kalau `callback_secret` di-provide → receiver verify auth of payload.
+- **Balance semantics** — `balance_after` + `balance_source` (SCRAPED/COMPUTED/UNAVAILABLE). Clientapp F1 primary re-scrape post-transfer, F3 fallback compute `balance_before - amount - admin_fee`. See doc §6k.
+
+### Admin Endpoints (require `X-Admin-Key: $ADMIN_API_KEY`)
+
+- `GET /api/admin/callbacks/stats?hours=24` — counts PENDING/DELIVERED/DEAD, retry_distribution, delivery_latency
+- `GET /api/admin/callbacks/dead?limit=50&offset=0` — paginated dead-letter list
+- `POST /api/admin/callbacks/replay/:task_id` — reset DEAD → PENDING, next_attempt_at=NOW, attempts=0
+
+Tanpa `ADMIN_API_KEY` di env → endpoints balikin 503 `feature not configured`.
+
+### ENV Baru (lihat `env.example`)
+
+- `ADMIN_API_KEY` (WAJIB prod, kalau mau pakai admin endpoints)
+- `CALLBACK_WORKER_INTERVAL_MS` (default 10000)
+- `CALLBACK_WORKER_BATCH` (default 20)
+- `CALLBACK_TIMEOUT_MS` (default 10000)
+- `CALLBACK_MAX_ATTEMPTS` (default 5)
+- `CALLBACK_MAX_AGE_HOURS` (default 24)
+
+### Status
+
+- **M3 Backend v4.1.0 code done 2026-11-02** — Track A node --check + require smoke + SSRF 10-URL test + HMAC verify PASS. Siap commit, belum deploy VPS.
+- **M4 Clientapp 3-app** — pending (brimo first per release plan).
+
+**Detail spec + decision log D1-D10 + release plan 4-repo + testing matrix:** `docs/feature-callback-2026-11-01.md`.
+
+---
+
 ## 6. Alur Kerja Rekomendasi per Sesi
 
 1. Baca `CLAUDE.md` (ini)

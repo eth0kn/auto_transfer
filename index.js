@@ -18,6 +18,11 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 
+// v4.1.0 (2026-11-01): Transfer Status Callback feature.
+// Spec: docs/feature-callback-2026-11-01.md
+const callbackWorker = require('./callback-worker');
+const { validateCallbackUrl, validateSecret } = require('./callback-security');
+
 // ==========================================================
 // CONSTANTS
 // ==========================================================
@@ -34,6 +39,9 @@ const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 10 * 60 * 100
 // Prevents 10-task burst → 10-ACK-same-timestamp → PROCESSING_STALE_MS false timeout.
 const DISPATCH_ACK_TIMEOUT_MS = parseInt(process.env.DISPATCH_ACK_TIMEOUT_MS) || 60000; // Q1 A1: 60s
 const LEGACY_UNPREFIXED = process.env.LEGACY_UNPREFIXED_ROUTES === 'true';
+// v4.1.0 (2026-11-01): admin key for callback admin endpoints (stats/dead/replay).
+// Required only for callback admin operations. If unset, admin endpoints 503.
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || null;
 // OBS (2026-10-31): observability bundle toggle. Set `OBS_VERBOSE=1` di env (ecosystem.config.js)
 // untuk enable verbose logging race investigation. Default OFF di prod. Zero behavior change.
 const OBS_VERBOSE = process.env.OBS_VERBOSE === '1' || process.env.OBS_VERBOSE === 'true';
@@ -258,6 +266,19 @@ function requireApiKey(app_source) {
     };
 }
 
+// v4.1.0 (2026-11-01): guard admin callback endpoints with X-Admin-Key.
+// If ADMIN_API_KEY unset in env, admin endpoints return 503 (feature not configured).
+function requireAdminKey(req, res, next) {
+    if (!ADMIN_API_KEY) {
+        return res.status(503).json({ error: 'ADMIN_API_KEY not configured in env' });
+    }
+    const key = req.headers['x-admin-key'];
+    if (!key || key !== ADMIN_API_KEY) {
+        return res.status(401).json({ error: 'Invalid or Missing X-Admin-Key' });
+    }
+    next();
+}
+
 // F1 (2026-10-29): load auto_approve_enabled from app_config DB.
 // Called once at server boot; also safe to re-invoke if ever needed.
 // Fails safe: if DB read errors, flag stays false (default disabled).
@@ -283,15 +304,36 @@ function createBotRouter(app_source) {
     // A. External submit — /{app}/transfer
     r.post('/transfer', requireApiKey(app_source), async (req, res) => {
         try {
-            const { alias, bank, dest, amount, pin } = req.body;
+            const { alias, bank, dest, amount, pin, callback_url, callback_secret } = req.body;
             if (!alias || !dest || !amount || !pin) {
                 return res.status(400).json({ success: false, msg: 'Data wajib diisi' });
             }
+
+            // v4.1.0 (2026-11-01): optional callback_url + callback_secret.
+            // SSRF guard: reject at create-time, task NOT created on bad URL.
+            let cbUrl = null, cbSecret = null, cbStatus = 'NONE';
+            if (callback_url) {
+                const urlCheck = await validateCallbackUrl(callback_url);
+                if (!urlCheck.valid) {
+                    return res.status(400).json({ success: false, msg: `callback_url rejected: ${urlCheck.reason}` });
+                }
+                const secCheck = validateSecret(callback_secret);
+                if (!secCheck.valid) {
+                    return res.status(400).json({ success: false, msg: `callback_secret rejected: ${secCheck.reason}` });
+                }
+                cbUrl = callback_url;
+                cbSecret = callback_secret || null;
+                cbStatus = 'NONE';  // becomes PENDING only after /update-task finalize
+            }
+
             const newTaskId = generateTrxId();
             await pool.execute(
-                `INSERT INTO transfer_request (id, app_source, bot_alias, bank_type, dest, amount, pin, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-                [newTaskId, app_source, alias, bank || 'BRI', dest, amount, pin]
+                `INSERT INTO transfer_request
+                   (id, app_source, bot_alias, bank_type, dest, amount, pin, status,
+                    callback_url, callback_secret, callback_status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
+                [newTaskId, app_source, alias, bank || 'BRI', dest, amount, pin,
+                 cbUrl, cbSecret, cbStatus]
             );
 
             // v4.0.0 ACK-P2: route through serial dispatcher (D1 scope — all emit paths).
@@ -341,7 +383,7 @@ function createBotRouter(app_source) {
     // C. Bot final report — /{app}/update-task
     r.post('/update-task', async (req, res) => {
         try {
-            const { task_id, status, message } = req.body;
+            const { task_id, status, message, balance_after, balance_source } = req.body;
             if (!['SUCCESS', 'FAILED'].includes(status)) {
                 return res.status(400).json({ msg: 'Invalid Status' });
             }
@@ -354,12 +396,26 @@ function createBotRouter(app_source) {
             const finalMessage = msgObj?.text || msgObj?.reason || '';
             const refNumber = msgObj?.ref_number || null;
 
+            // v4.1.0 (2026-11-01): validate balance_after + balance_source from clientapp.
+            // Accept null safely; reject garbage via server-side enum guard before DB enum throws.
+            const VALID_BALANCE_SOURCES = ['SCRAPED', 'COMPUTED', 'UNAVAILABLE'];
+            const normalizedBalanceAfter =
+                balance_after != null && Number.isFinite(Number(balance_after))
+                    ? Math.round(Number(balance_after))
+                    : null;
+            const normalizedBalanceSource =
+                balance_source && VALID_BALANCE_SOURCES.includes(String(balance_source).toUpperCase())
+                    ? String(balance_source).toUpperCase()
+                    : null;
+
             // v4.0.1 M1/S1 cross-fix (2026-11-01): capture bot_alias for dispatcher free call.
+            // v4.1.0: also capture callback_url to decide callback_status transition.
             const [rows] = await pool.execute(
-                `SELECT bot_alias FROM transfer_request WHERE id = ? AND app_source = ?`,
+                `SELECT bot_alias, callback_url FROM transfer_request WHERE id = ? AND app_source = ?`,
                 [task_id, app_source]
             );
             const bot_alias = rows[0]?.bot_alias;
+            const hasCallback = !!rows[0]?.callback_url;
 
             // v4.0.2 W2+W6/V2-F10 (2026-11-01): UPDATE guard WHERE status IN ('PENDING', 'PROCESSING').
             // W2 original: WHERE status='PROCESSING' — but blocked reject-path flow (bot rejects
@@ -368,10 +424,31 @@ function createBotRouter(app_source) {
             // EITHER non-terminal state. Only blocks genuine duplicate reports where status
             // already terminal (SUCCESS/FAILED). Parity concept dengan F4 (prevent double-free)
             // tapi preserve M1/S1 cross-fix untuk reject-path.
+            //
+            // v4.1.0 (2026-11-01): atomic update extend — balance_after, balance_source, +
+            // conditional callback_status transition NONE→PENDING kalau callback_url present.
+            // Transactional outbox pattern (spec §6b): status finalize + callback enqueue
+            // in ONE statement, zero race window.
             const [updResult] = await pool.execute(
-                `UPDATE transfer_request SET status = ?, message = ?, ref_number = ?, updated_at = NOW()
+                `UPDATE transfer_request SET
+                   status = ?,
+                   message = ?,
+                   ref_number = ?,
+                   balance_after = ?,
+                   balance_source = ?,
+                   callback_status = CASE
+                     WHEN callback_url IS NOT NULL AND callback_status = 'NONE' THEN 'PENDING'
+                     ELSE callback_status
+                   END,
+                   callback_next_attempt_at = CASE
+                     WHEN callback_url IS NOT NULL AND callback_status = 'NONE' THEN NOW()
+                     ELSE callback_next_attempt_at
+                   END,
+                   updated_at = NOW()
                  WHERE id = ? AND app_source = ? AND status IN ('PENDING', 'PROCESSING')`,
-                [status, finalMessage, refNumber, task_id, app_source]
+                [status, finalMessage, refNumber,
+                 normalizedBalanceAfter, normalizedBalanceSource,
+                 task_id, app_source]
             );
             if (updResult.affectedRows === 0) {
                 console.warn(`[${app_source}] [UPDATE-TASK IGNORED] task ${task_id} status=${status} — no matching PROCESSING row (double-POST race or stale report)`);
@@ -401,6 +478,13 @@ function createBotRouter(app_source) {
             }
 
             res.json({ success: true });
+
+            // v4.1.0 (2026-11-01): fire-and-forget — signal callback worker to pick up this
+            // newly-enqueued delivery immediately (optional; worker tick 10s also picks it up).
+            // Must be AFTER res.json so client is not blocked waiting callback dispatch.
+            if (hasCallback) {
+                callbackWorker.signalPickup();
+            }
         } catch (err) {
             console.error(`[${app_source}] [UPDATE-TASK ERROR]`, err.message);
             res.status(500).json({ success: false });
@@ -1374,6 +1458,46 @@ setInterval(async () => {
 }, 60000);
 
 // ==========================================================
+// v4.1.0 (2026-11-01): CALLBACK ADMIN ENDPOINTS
+// Spec: docs/feature-callback-2026-11-01.md §8
+// Auth: X-Admin-Key header must match env ADMIN_API_KEY.
+// ==========================================================
+app.get('/api/admin/callbacks/stats', requireAdminKey, async (req, res) => {
+    try {
+        const hours = parseInt(req.query.hours, 10);
+        const stats = await callbackWorker.getStats(pool, Number.isFinite(hours) ? hours : 24);
+        res.json(stats);
+    } catch (err) {
+        console.error('[CALLBACK-ADMIN /stats]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/callbacks/dead', requireAdminKey, async (req, res) => {
+    try {
+        const result = await callbackWorker.listDead(pool, req.query.limit, req.query.offset);
+        res.json(result);
+    } catch (err) {
+        console.error('[CALLBACK-ADMIN /dead]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/callbacks/replay/:task_id', requireAdminKey, async (req, res) => {
+    try {
+        const result = await callbackWorker.replayTask(pool, req.params.task_id);
+        if (result.success) {
+            callbackWorker.signalPickup();
+            return res.json({ success: true, task_id: req.params.task_id });
+        }
+        return res.status(409).json({ success: false, reason: result.reason, task_id: req.params.task_id });
+    } catch (err) {
+        console.error('[CALLBACK-ADMIN /replay]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================================
 // R5 (2026-10-30): CRASH SAFETY HANDLERS
 // Prevent 1 unhandled async throw / uncaught exception from killing
 // backend when running 30+ bot socket + concurrent transfers.
@@ -1386,6 +1510,17 @@ process.on('unhandledRejection', (reason, promise) => {
 
 process.on('uncaughtException', (err) => {
     console.error('💥 [UNCAUGHT EXCEPTION]', err.stack || err);
+});
+
+// v4.1.0 (2026-11-01): graceful shutdown — stop callback worker ticks on SIGTERM/SIGINT.
+// In-flight fetch() allowed to finish (up to CALLBACK_TIMEOUT_MS). PM2 reload = zero lost delivery.
+process.on('SIGTERM', () => {
+    console.log('📴 [SIGTERM] shutdown signal received');
+    callbackWorker.shutdown();
+});
+process.on('SIGINT', () => {
+    console.log('📴 [SIGINT] shutdown signal received');
+    callbackWorker.shutdown();
 });
 
 // ==========================================================
@@ -1401,9 +1536,12 @@ server.listen(PORT, () => {
     console.log(`   Stale PROCESSING threshold: ${PROCESSING_STALE_MS}ms`);
     console.log(`   Stale PENDING threshold: ${PENDING_STALE_MS}ms (${Math.round(PENDING_STALE_MS/60000)} min)`);
     console.log(`   Legacy unprefixed routes: ${LEGACY_UNPREFIXED ? 'ENABLED' : 'disabled'}`);
+    console.log(`   Callback feature: ${ADMIN_API_KEY ? 'ENABLED (admin endpoints LIVE)' : 'core only (ADMIN_API_KEY unset → admin endpoints 503)'}`);
     console.log('==========================================');
     // F1 (2026-10-29): load auto-approve flag from DB (fire-and-forget, logs own result)
     loadAutoApprovalState();
+    // v4.1.0 (2026-11-01): start callback delivery worker.
+    callbackWorker.start(pool);
 });
 
 // ==========================================================
