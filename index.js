@@ -398,11 +398,15 @@ function createBotRouter(app_source) {
 
             // v4.1.0 (2026-11-01): validate balance_after + balance_source from clientapp.
             // Accept null safely; reject garbage via server-side enum guard before DB enum throws.
+            // G1 MED-2 (2026-11-02): add n>=0 guard. Backend authoritative, mirror the
+            // >=0 invariant clientapps already enforce in F3 compute path. Prevents a
+            // future/custom clientapp from storing nonsense negative value in BIGINT col.
             const VALID_BALANCE_SOURCES = ['SCRAPED', 'COMPUTED', 'UNAVAILABLE'];
-            const normalizedBalanceAfter =
-                balance_after != null && Number.isFinite(Number(balance_after))
-                    ? Math.round(Number(balance_after))
-                    : null;
+            const normalizedBalanceAfter = (() => {
+                if (balance_after == null) return null;
+                const n = Number(balance_after);
+                return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+            })();
             const normalizedBalanceSource =
                 balance_source && VALID_BALANCE_SOURCES.includes(String(balance_source).toUpperCase())
                     ? String(balance_source).toUpperCase()

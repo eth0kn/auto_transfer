@@ -159,11 +159,17 @@ async function deliver(row) {
         const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
         let outcome;
         try {
+            // G1 HIGH-1 (2026-11-02): redirect:'manual' prevents SSRF via attacker-controlled
+            // HTTPS server returning 302 Location: http://169.254.169.254/metadata (AWS/GCP
+            // metadata exfil). SSRF validator (callback-security.js) only vets initial URL;
+            // fetch default redirect:'follow' bypasses it on redirect hop. 3xx now classified
+            // as retry outcome (webhook receivers shouldn't redirect — treat as misconfig).
             const res = await fetch(row.callback_url, {
                 method: 'POST',
                 headers,
                 body,
                 signal: controller.signal,
+                redirect: 'manual',
             });
             clearTimeout(timer);
             const dur = Date.now() - t0;
@@ -171,6 +177,10 @@ async function deliver(row) {
             state.latencyCount++;
             if (res.status >= 200 && res.status < 300) {
                 outcome = { kind: 'delivered', status: res.status, dur };
+            } else if (res.status >= 300 && res.status < 400) {
+                // G1 HIGH-1: 3xx not followed → treat as retry with explicit reason so
+                // operator sees pattern in log (receiver misconfig vs SSRF probe attempt).
+                outcome = { kind: 'retry', status: res.status, dur, reason: `redirect:${res.status}` };
             } else if (res.status >= 400 && res.status < 500) {
                 outcome = { kind: 'dead_4xx', status: res.status, dur };
             } else {

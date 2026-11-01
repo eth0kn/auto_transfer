@@ -134,7 +134,7 @@ API caller boleh ikutkan `callback_url` + `callback_secret` opsional di `POST /{
 - **At-least-once delivery** dengan task_id sebagai dedupe key — receiver WAJIB idempotent per task_id (karena HTTP semantic: 2xx = DELIVERED, 4xx = DEAD, 5xx + timeout + net error = retry → receiver mungkin terima dupe).
 - **Transactional outbox** — status finalize + callback enqueue di 1 UPDATE statement, zero race.
 - **Fire-and-forget** — `signalPickup()` setelah `res.json({success:true})`, dispatcher critical section unaffected oleh callback latency.
-- **HMAC-SHA256 header** `X-Callback-Signature: sha256=<hex>` kalau `callback_secret` di-provide → receiver verify auth of payload.
+- **HMAC-SHA256 header** `X-Autotransfer-Signature: sha256=<hex>` kalau `callback_secret` di-provide → receiver verify auth of payload. (Full header set: `X-Autotransfer-Task-Id`, `-App-Source`, `-Delivery-Id`, `-Attempt`, `-Signature`, `-Issued-At`.)
 - **Balance semantics** — `balance_after` + `balance_source` (SCRAPED/COMPUTED/UNAVAILABLE). Clientapp F1 primary re-scrape post-transfer, F3 fallback compute `balance_before - amount - admin_fee`. See doc §6k.
 
 ### Admin Endpoints (require `X-Admin-Key: $ADMIN_API_KEY`)
