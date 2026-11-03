@@ -100,6 +100,23 @@ function emitToBot(app_source, alias, event, payload) {
         }
         return false;
     }
+    // v4.2.0 M9: passive_mirror socket = clientapp registered utk mirror-only (bot engine tidak running).
+    // Dispatch dilewati — task tetap PENDING sampai bot engine aktif register ulang (non-passive).
+    if (sock.passive_mirror) {
+        if (OBS_VERBOSE) {
+            console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} FAIL=passive_mirror ts_ms=${Date.now()}`);
+        }
+        return false;
+    }
+    // v4.1.3 Fase 1 (2026-11-04): guard emit ke socket pending-removal (60s grace timeout).
+    // Entry tetap di botSockets selama grace period, tapi emit harus dilewati — socket dead,
+    // task harus wait sampai bot re-register (fresh socket) atau prune tick clear entry.
+    if (sock.disconnected_at) {
+        if (OBS_VERBOSE) {
+            console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} FAIL=disconnected_pending_removal ts_ms=${Date.now()}`);
+        }
+        return false;
+    }
     if (OBS_VERBOSE) {
         console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} socket_id=${sock.id} connected=${sock.connected} ts_ms=${Date.now()} task_id=${payload && payload.task_id || '-'}`);
     }
@@ -1010,11 +1027,47 @@ app.get('/api/bots', requireAuth, (req, res) => {
             device_id: sock.device_id || null,
             bot_id: sock.bot_id || null,
             connected_at: sock.connected_at || null,
-            online: true
+            // v4.1.3 Fase 1 (2026-11-04): reflect actual state (hardcoded true would lie
+            // during 60s grace window after disconnect — mirror hub would show "online"
+            // for cards that are actually dead but still in registry).
+            online: !sock.disconnected_at && sock.connected !== false
         });
     }
     bots.sort((a, b) => a.alias.localeCompare(b.alias));
     res.json(bots);
+});
+
+// v4.2.0 M6: GET /api/mirror/devices — device registry untuk mirror-proxy hub
+// Dual auth: cookie isLoggedIn (browser) OR X-Admin-Key header (mirror-proxy machine-to-machine)
+app.get('/api/mirror/devices', (req, res) => {
+    const providedKey = req.headers['x-admin-key'];
+    const cookieAuth = req.cookies.isLoggedIn === 'true';
+    const keyAuth = ADMIN_API_KEY && providedKey && providedKey === ADMIN_API_KEY;
+    if (!cookieAuth && !keyAuth) {
+        return res.status(401).json({ error: 'unauthorized' });
+    }
+    const appFilter = (req.query.app || 'all').toLowerCase();
+    const devices = [];
+    for (const [key, sock] of botSockets.entries()) {
+        const idx = key.indexOf(':');
+        const app_source = key.substring(0, idx);
+        const alias = key.substring(idx + 1);
+        if (appFilter !== 'all' && app_source !== appFilter) continue;
+        devices.push({
+            alias,
+            app_source,
+            device_id: sock.device_id || null,
+            rdp_ts_ip: sock.rdp_ts_ip || null,
+            rdp_hostname: sock.rdp_hostname || null,
+            passive_mirror: sock.passive_mirror === true, // v4.2.0 M9
+            connected_at: sock.connected_at || null,
+            // v4.1.3 Fase 1 (2026-11-04): reflect actual online state (60s grace window
+            // disconnected → online: false, mirror hub UI shows card dgn status accurate).
+            online: !sock.disconnected_at && sock.connected !== false
+        });
+    }
+    devices.sort((a, b) => a.alias.localeCompare(b.alias));
+    res.json(devices);
 });
 
 // ==========================================================
@@ -1253,7 +1306,10 @@ function setupBotNamespace(app_source) {
         socket.app_source = app_source;
 
         socket.on('bot:register', async (payload) => {
-            const { bot_id, alias, device_id } = payload || {};
+            // v4.2.0 M6: accept optional rdp_ts_ip + rdp_hostname for mirror hub registry
+            // v4.2.0 M9: accept optional passive_mirror flag — kalau true, clientapp register
+            // untuk mirror listing only (bot engine tidak running). Dispatcher skip emit ke socket ini.
+            const { bot_id, alias, device_id, rdp_ts_ip, rdp_hostname, passive_mirror } = payload || {};
             if (!alias) return console.log(`❌ [${app_source}] bot:register missing alias`);
             if (!bot_id) return console.log(`⚠️ [${app_source}] bot:register without bot_id`);
 
@@ -1273,20 +1329,31 @@ function setupBotNamespace(app_source) {
             socket.bot_id = bot_id;
             socket.device_id = device_id;
             socket.alias = alias;
+            // v4.2.0 M6: mirror hub coordinates — store RDP Tailscale IP + hostname
+            socket.rdp_ts_ip = rdp_ts_ip || null;
+            socket.rdp_hostname = rdp_hostname || null;
+            // v4.2.0 M9: passive mirror flag — dispatcher skip
+            socket.passive_mirror = passive_mirror === true;
             socket.connected_at = new Date().toISOString();
+            // v4.1.3 Fase 1 (2026-11-04): fresh register = clear pending-removal state.
+            // Kalau socket reconnect sebelum 60s grace expire, wipe timestamp supaya tidak
+            // auto-pruned by next tick. emitToBot guard akan allow emit lagi.
+            socket.disconnected_at = null;
 
             botSockets.set(key, socket);
 
-            if (isReRegister) {
-                console.log(`🔁 [${app_source}] BOT RE-REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
-            } else {
-                console.log(`🤖 [${app_source}] BOT REGISTERED: ${bot_id} ${alias} (${device_id || '-'})`);
-            }
-            io.emit('bot:status', { alias, app_source, device_id, online: true, connected_at: socket.connected_at });
+            const regLabel = socket.passive_mirror ? 'PASSIVE MIRROR REGISTERED' : (isReRegister ? 'BOT RE-REGISTERED' : 'BOT REGISTERED');
+            console.log(`${socket.passive_mirror ? '📺' : (isReRegister ? '🔁' : '🤖')} [${app_source}] ${regLabel}: ${bot_id} ${alias} (${device_id || '-'})`);
+            io.emit('bot:status', { alias, app_source, device_id, online: true, connected_at: socket.connected_at, passive_mirror: socket.passive_mirror });
 
             // v4.0.0 ACK-P2: backlog dispatch via serial dispatcher (replaces for-loop burst).
             // On bot reconnect, clear any stale dispatcher state + pull SINGLE next PENDING.
             // Chain continues on each ACK (freeDispatcherAndPullNext in task:ack handler).
+            // v4.2.0 M9: SKIP backlog dispatch untuk passive_mirror — tidak ada bot engine utk consume task.
+            if (socket.passive_mirror) {
+                // mirror-only register, abaikan dispatcher sepenuhnya
+                return;
+            }
             try {
                 clearDispatcherState(app_source, alias); // fresh slate on bot:register
                 const [countRows] = await pool.execute(
@@ -1365,8 +1432,13 @@ function setupBotNamespace(app_source) {
             // v4.0.1 F2 (2026-11-01): clear dispatcher state. Prevents 60s window where
             // POST /transfer same alias sees busy dispatcher + silent PENDING queue.
             clearDispatcherState(app_source, alias);
-            botSockets.delete(key);
-            console.log(`🔴 [${app_source}] BOT DISCONNECTED: ${socket.bot_id} ${alias} | ${reason}`);
+            // v4.1.3 Fase 1 (2026-11-04): DELAY delete — set disconnected_at timestamp.
+            // Prune tick (60s interval) akan hapus entry setelah grace > 60000ms. Card
+            // tetap muncul di mirror hub selama grace period, kemudian auto-remove.
+            // bot:unregister handler (L1384) tetap IMMEDIATE delete — user intent eksplisit.
+            // emitToBot L95 guard disconnected_at — task tidak akan di-emit ke dead socket.
+            socket.disconnected_at = Date.now();
+            console.log(`🟡 [${app_source}] BOT DISCONNECTED: ${socket.bot_id} ${alias} | ${reason} (card kept 60s grace)`);
             io.emit('bot:status', { alias, app_source, online: false });
 
             // Fail PROCESSING task milik bot ini
@@ -1446,15 +1518,27 @@ setInterval(async () => {
         // tapi masih di Map). Target: legacy clients yang unclean crash, atau orphan
         // dari socket.alias overwrite pattern. Backward-compat untuk bugged clients
         // yang belum di-refactor ke per-engine socket (brimo <v3.8.0, mybca, seabank).
+        // v4.1.3 Fase 1 (2026-11-04): dual-condition prune.
+        //   1. silentDrop (!sock.connected): socket.io heartbeat detected drop tapi
+        //      disconnect handler tidak fire (legacy clients, orphan dari socket.alias
+        //      overwrite pattern).
+        //   2. graceExpired (disconnected_at > 60s ago): disconnect handler fired,
+        //      kartu stayed di mirror hub selama grace period 60s, sekarang auto-remove.
         let prunedCount = 0;
+        const nowPrune = Date.now();
         for (const [key, sock] of botSockets.entries()) {
-            if (!sock.connected) {
+            const silentDrop = !sock.connected;
+            const graceExpired = sock.disconnected_at && (nowPrune - sock.disconnected_at) > 60000;
+            if (silentDrop || graceExpired) {
                 const idx = key.indexOf(':');
                 const app_source = key.substring(0, idx);
                 const alias = key.substring(idx + 1);
                 botSockets.delete(key);
                 io.emit('bot:status', { alias, app_source, online: false });
-                console.log(`🧹 [prune] Removed stale socket ${key} (socket.connected=false)`);
+                const reason = graceExpired
+                    ? `60s grace expired (${Math.round((nowPrune - sock.disconnected_at) / 1000)}s)`
+                    : 'socket.connected=false';
+                console.log(`🧹 [prune] Removed stale socket ${key} (${reason})`);
                 prunedCount++;
             }
         }
