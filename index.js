@@ -33,7 +33,12 @@ const VALIDATION_TIMEOUT_MS = parseInt(process.env.VALIDATION_TIMEOUT_MS) || 600
 // network transfer saat scale 150 trx / 30 bots serial — causes SUCCESS stamp onto
 // FAILED row race. 300s = 5min safety window, still catches true stuck/crashed bot.
 const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 300000;
-const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 10 * 60 * 1000; // 10 min
+// v4.1.2 (2026-11-03): raised from 10m → 2h. 10m was too tight saat antrian padat —
+// legit PENDING tasks di-cancel sebelum bot sempat ambil, meskipun bot online. 2h =
+// safety window besar untuk serial dispatcher ACK-P2 queue tanpa false-positive cancel.
+// Independen dari PROCESSING_STALE_MS (bot crash while running) + VALIDATION_TIMEOUT_MS
+// (bot validation step) + DISPATCH_ACK_TIMEOUT_MS (per-alias ACK).
+const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 2 * 60 * 60 * 1000; // 2 hours
 // v4.0.0 ACK-P2 (2026-10-31): per-alias dispatcher back-pressure.
 // Backend emits task:new ONE AT A TIME per bot alias; next emit waits for ACK.
 // Prevents 10-task burst → 10-ACK-same-timestamp → PROCESSING_STALE_MS false timeout.
