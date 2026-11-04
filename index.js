@@ -1053,6 +1053,9 @@ app.get('/api/mirror/devices', (req, res) => {
         const app_source = key.substring(0, idx);
         const alias = key.substring(idx + 1);
         if (appFilter !== 'all' && app_source !== appFilter) continue;
+        // v4.3.0 (2026-11-04): filter out explicit mirror_enabled=false — clientapp toggle OFF
+        // di dashboard card means akun tidak mau muncul di hub. Backward compat: undefined/true → show.
+        if (sock.mirror_enabled === false) continue;
         devices.push({
             alias,
             app_source,
@@ -1060,6 +1063,7 @@ app.get('/api/mirror/devices', (req, res) => {
             rdp_ts_ip: sock.rdp_ts_ip || null,
             rdp_hostname: sock.rdp_hostname || null,
             passive_mirror: sock.passive_mirror === true, // v4.2.0 M9
+            mirror_enabled: sock.mirror_enabled !== false, // v4.3.0 (explicit untuk observability)
             connected_at: sock.connected_at || null,
             // v4.1.3 Fase 1 (2026-11-04): reflect actual online state (60s grace window
             // disconnected → online: false, mirror hub UI shows card dgn status accurate).
@@ -1309,7 +1313,9 @@ function setupBotNamespace(app_source) {
             // v4.2.0 M6: accept optional rdp_ts_ip + rdp_hostname for mirror hub registry
             // v4.2.0 M9: accept optional passive_mirror flag — kalau true, clientapp register
             // untuk mirror listing only (bot engine tidak running). Dispatcher skip emit ke socket ini.
-            const { bot_id, alias, device_id, rdp_ts_ip, rdp_hostname, passive_mirror } = payload || {};
+            // v4.3.0 (2026-11-04): accept optional mirror_enabled flag — clientapp toggle per
+            // akun di dashboard card. Backward compat: payload tanpa field → treat as enabled.
+            const { bot_id, alias, device_id, rdp_ts_ip, rdp_hostname, passive_mirror, mirror_enabled } = payload || {};
             if (!alias) return console.log(`❌ [${app_source}] bot:register missing alias`);
             if (!bot_id) return console.log(`⚠️ [${app_source}] bot:register without bot_id`);
 
@@ -1334,6 +1340,10 @@ function setupBotNamespace(app_source) {
             socket.rdp_hostname = rdp_hostname || null;
             // v4.2.0 M9: passive mirror flag — dispatcher skip
             socket.passive_mirror = passive_mirror === true;
+            // v4.3.0 (2026-11-04): mirror_enabled flag — controls /api/mirror/devices visibility.
+            // Backward compat: undefined → treat as enabled (allows pre-v4.3.0 bots to keep working).
+            // Clientapp bots v4.3.0+ selalu kirim field explicit (true/false).
+            socket.mirror_enabled = (mirror_enabled === undefined) ? true : (mirror_enabled !== false);
             socket.connected_at = new Date().toISOString();
             // v4.1.3 Fase 1 (2026-11-04): fresh register = clear pending-removal state.
             // Kalau socket reconnect sebelum 60s grace expire, wipe timestamp supaya tidak
