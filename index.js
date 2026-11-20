@@ -22,6 +22,8 @@ const { execFile, spawn } = require('child_process');
 // Spec: docs/feature-callback-2026-11-01.md
 const callbackWorker = require('./callback-worker');
 const { validateCallbackUrl, validateSecret } = require('./callback-security');
+const bcrypt = require('bcrypt'); // v4.1.5 (2026-11-21): multi-user dashboard auth via DB + bcrypt
+const BCRYPT_COST = 10;
 
 // ==========================================================
 // CONSTANTS
@@ -1284,15 +1286,44 @@ function handleNewAuthId(authId) {
 // Start watcher after server listen (async)
 setTimeout(startHeadscaleLogWatcher, 2000);
 
-app.post('/api/login', (req, res) => {
-    const { username, password } = req.body;
-    const validUser = process.env.DASHBOARD_USER || 'admin';
-    const validPass = process.env.DASHBOARD_PASS || 'admin123';
-    if (username === validUser && password === validPass) {
-        res.cookie('isLoggedIn', 'true', { maxAge: 4 * 60 * 60 * 1000, httpOnly: true });
-        return res.json({ success: true });
+// v4.1.5 (2026-11-21): multi-user dashboard auth — DB lookup + bcrypt.compare.
+// Env DASHBOARD_USER/DASHBOARD_PASS tidak lagi di-consume (di-seed ke DB saat
+// migration via scripts/add-user.js). Table dashboard_users dengan password_hash
+// bcrypt cost 10 + soft delete (disabled=1). Timing-attack-resistant via dummy
+// bcrypt.compare untuk user tidak exist.
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+        return res.status(400).json({ success: false, msg: 'Username dan password wajib' });
     }
-    res.status(401).json({ success: false, msg: 'Username atau Password salah' });
+    try {
+        const conn = await pool.getConnection();
+        try {
+            const [rows] = await conn.execute(
+                'SELECT id, password_hash FROM dashboard_users WHERE username = ? AND disabled = 0 LIMIT 1',
+                [username]
+            );
+            if (rows.length === 0) {
+                // Dummy bcrypt.compare untuk constant-time response (anti user enumeration)
+                await bcrypt.compare(password, '$2b$10$DUMMYDUMMYDUMMYDUMMYDuxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
+                return res.status(401).json({ success: false, msg: 'Username atau Password salah' });
+            }
+            const ok = await bcrypt.compare(password, rows[0].password_hash);
+            if (!ok) {
+                return res.status(401).json({ success: false, msg: 'Username atau Password salah' });
+            }
+            // Update last_login_at (fire-and-forget — tidak block response)
+            conn.execute('UPDATE dashboard_users SET last_login_at = NOW() WHERE id = ?', [rows[0].id])
+                .catch((e) => console.error('[login] last_login_at update failed:', e.message));
+            res.cookie('isLoggedIn', 'true', { maxAge: 4 * 60 * 60 * 1000, httpOnly: true });
+            return res.json({ success: true });
+        } finally {
+            conn.release();
+        }
+    } catch (err) {
+        console.error('[login] DB error:', err.message);
+        return res.status(500).json({ success: false, msg: 'Server error' });
+    }
 });
 
 app.get('/logout', (req, res) => {
@@ -1597,6 +1628,97 @@ app.post('/api/admin/callbacks/replay/:task_id', requireAdminKey, async (req, re
     } catch (err) {
         console.error('[CALLBACK-ADMIN /replay]', err.message);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================================
+// v4.1.5 (2026-11-21): MULTI-USER DASHBOARD AUTH — USER CRUD
+// ADMIN_API_KEY protected (reuse requireAdminKey middleware).
+// Soft delete pattern (disabled=1), no hard delete (audit trail preserved).
+// ==========================================================
+
+// POST /api/admin/users — create user
+// Body: { username: string, password: string }
+app.post('/api/admin/users', requireAdminKey, async (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+        return res.status(400).json({ error: 'username + password required' });
+    }
+    if (typeof username !== 'string' || username.length < 3 || username.length > 100) {
+        return res.status(400).json({ error: 'username must be 3-100 chars' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
+        return res.status(400).json({ error: 'password min 6 chars' });
+    }
+    try {
+        const hash = await bcrypt.hash(password, BCRYPT_COST);
+        const conn = await pool.getConnection();
+        try {
+            const [result] = await conn.execute(
+                'INSERT INTO dashboard_users (username, password_hash) VALUES (?, ?)',
+                [username, hash]
+            );
+            return res.status(201).json({ id: result.insertId, username });
+        } finally {
+            conn.release();
+        }
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: `Username '${username}' already exists` });
+        }
+        console.error('[ADMIN /users POST]', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/admin/users — list users (password_hash NEVER included in response)
+app.get('/api/admin/users', requireAdminKey, async (req, res) => {
+    try {
+        const conn = await pool.getConnection();
+        try {
+            const [rows] = await conn.execute(
+                'SELECT id, username, created_at, last_login_at, disabled FROM dashboard_users ORDER BY id ASC'
+            );
+            return res.json({ users: rows });
+        } finally {
+            conn.release();
+        }
+    } catch (err) {
+        console.error('[ADMIN /users GET]', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE /api/admin/users/:id — soft delete (set disabled=1)
+app.delete('/api/admin/users/:id', requireAdminKey, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id || id < 1) {
+        return res.status(400).json({ error: 'Invalid user id' });
+    }
+    try {
+        const conn = await pool.getConnection();
+        try {
+            // Guard: prevent deleting the last active user (lock out risk)
+            const [countRows] = await conn.execute(
+                'SELECT COUNT(*) AS n FROM dashboard_users WHERE disabled = 0'
+            );
+            if (countRows[0].n <= 1) {
+                return res.status(409).json({ error: 'Cannot disable last active user (lock-out protection)' });
+            }
+            const [result] = await conn.execute(
+                'UPDATE dashboard_users SET disabled = 1 WHERE id = ? AND disabled = 0',
+                [id]
+            );
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'User not found or already disabled' });
+            }
+            return res.json({ success: true, id, disabled: 1 });
+        } finally {
+            conn.release();
+        }
+    } catch (err) {
+        console.error('[ADMIN /users DELETE]', err.message);
+        return res.status(500).json({ error: err.message });
     }
 });
 
