@@ -77,6 +77,11 @@ const botSockets = new Map();       // key: `${app_source}:${alias}` → socket
 const validationTimers = new Map(); // key: task_id → setTimeout handle
 const taskOwner = new Map();        // key: task_id → { app, alias }
 
+// Sprint 2e (v4.3.8): control-plane sockets from clientapp main.js (one per clientapp per RDP).
+// Keyed by `${app_source}:${rdp_hostname}` — separate namespace from per-engine botSockets.
+// Receives tg:account_create/edit/delete events from telegram-bot-ipc.js round-trip calls.
+const rdpControlSockets = new Map();
+
 // F1 (2026-10-29): Auto-approve global toggle.
 // Loaded from app_config DB on boot (see loadAutoApprovalState).
 // Mutated by /api/auto-approve/{enable,disable} endpoints.
@@ -1041,8 +1046,20 @@ app.get('/api/bots', requireAuth, (req, res) => {
 
 // v4.3.2 Sprint 2b (2026-11-22): Telegram Bot IPC — loopback + Bearer auth
 // Module at ./telegram-bot-ipc.js; mounted here only to share app + pool.
+// Sprint 2e (v4.3.8): inject control-socket emitter so IPC routes can round-trip.
 const tgIpc = require('./telegram-bot-ipc');
 tgIpc.setDb(pool);
+tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
+    const key = `${app_source}:${rdp_hostname}`;
+    const sock = rdpControlSockets.get(key);
+    if (!sock || sock.disconnected_at) return false;
+    try {
+        sock.emit(event, payload);
+        return true;
+    } catch (_) {
+        return false;
+    }
+});
 app.use('/api/tg', tgIpc.router);
 
 // v4.2.0 M6: GET /api/mirror/devices — device registry untuk mirror-proxy hub
@@ -1528,7 +1545,50 @@ function setupBotNamespace(app_source) {
             io.emit('bot:status', { alias: socket.alias, app_source, online: false });
         });
 
+        // Sprint 2e (v4.3.8): control-plane socket registration from clientapp main.js.
+        // Distinct from bot:register — no engine semantics, no rdp_registry upsert
+        // (that's bot:register's job). Just stashes socket for tg:account_* round-trips.
+        socket.on('rdp:control_register', (payload) => {
+            const { rdp_hostname } = payload || {};
+            if (!rdp_hostname) {
+                console.log(`❌ [${app_source}] rdp:control_register missing rdp_hostname`);
+                socket.emit('rdp:control_registered', { ok: false, error: 'missing_rdp_hostname' });
+                return;
+            }
+            const key = `${app_source}:${rdp_hostname}`;
+            const existing = rdpControlSockets.get(key);
+            if (existing && existing.id !== socket.id) {
+                try {
+                    existing.disconnect(true);
+                    console.log(`🚪 [${app_source}] Force-disconnected old control socket ${existing.id} for ${rdp_hostname}`);
+                } catch (_) { /* already dead */ }
+            }
+            socket.is_control_plane = true;
+            socket.control_rdp_hostname = rdp_hostname;
+            rdpControlSockets.set(key, socket);
+            console.log(`🎛️ [${app_source}] CONTROL-PLANE REGISTERED: ${rdp_hostname} (socket ${socket.id})`);
+            socket.emit('rdp:control_registered', { ok: true, rdp_hostname });
+        });
+
+        // Sprint 2e (v4.3.8): ack dispatch for round-trip from telegram-bot-ipc.js /account/*.
+        // Clientapp emits this after executing DB CRUD + adb pair with request_id echoed back.
+        socket.on('tg:account_ack', (payload) => {
+            try { tgIpc.resolveAck(payload); }
+            catch (e) { console.error('[tg-ctrl] resolveAck threw:', e.message); }
+        });
+
         socket.on('disconnect', async (reason) => {
+            // Sprint 2e (v4.3.8): control-plane socket cleanup. Runs first — control sockets
+            // don't have bot_id so the bot cleanup path below short-circuits for them.
+            if (socket.is_control_plane && socket.control_rdp_hostname) {
+                const ctrlKey = `${app_source}:${socket.control_rdp_hostname}`;
+                const current = rdpControlSockets.get(ctrlKey);
+                if (current && current.id === socket.id) {
+                    rdpControlSockets.delete(ctrlKey);
+                    console.log(`🎛️ [${app_source}] CONTROL-PLANE DISCONNECTED: ${socket.control_rdp_hostname} | ${reason}`);
+                }
+            }
+
             if (!socket.bot_id) return;
             const key = `${app_source}:${socket.alias}`;
             const alias = socket.alias;

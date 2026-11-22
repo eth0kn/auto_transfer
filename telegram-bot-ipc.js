@@ -5,12 +5,59 @@
 // Mounted at /api/tg from index.js.
 // Auth: Bearer TG_BOT_API_KEY (shared .env) + 127.0.0.1-only enforcement.
 
+const crypto = require('crypto');
 const express = require('express');
 const router = express.Router();
 
 // Shared pool reference set by setDb()
 let pool = null;
 function setDb(p) { pool = p; }
+
+// Sprint 2e (v4.3.8): round-trip to clientapp control socket.
+// `emitFn(app_source, rdp_hostname, event, payload) => bool` is injected by index.js.
+// `resolveAck(payload)` is called from index.js tg:account_ack listener.
+// `pendingTgRequests` map holds in-flight round trips; 30s timeout.
+let emitFn = null;
+function setEmitter(fn) { emitFn = fn; }
+const pendingTgRequests = new Map(); // request_id → {resolve, reject, timer}
+const DEFAULT_ROUNDTRIP_MS = parseInt(process.env.TG_ROUNDTRIP_MS || '30000', 10);
+function resolveAck(payload) {
+    if (!payload?.request_id) return;
+    const pending = pendingTgRequests.get(payload.request_id);
+    if (!pending) return; // already timed out or ack for unknown request
+    clearTimeout(pending.timer);
+    pendingTgRequests.delete(payload.request_id);
+    if (payload.ok) pending.resolve(payload);
+    else pending.reject({ code: payload.error_code || 'client_error', detail: payload.error_message });
+}
+
+/**
+ * Send event to the target RDP's control socket, await ack with timeout.
+ * Returns: { ok: true, result } on success, { ok: false, error, detail, status } on failure.
+ * app_source defaults to 'brimo' for Sprint 2e scope — Sprint 2f expands to mybca/seabank.
+ */
+async function callClientapp(rdp_hostname, event, payload, opts = {}) {
+    const app_source = opts.app_source || 'brimo';
+    const timeout_ms = opts.timeout_ms || DEFAULT_ROUNDTRIP_MS;
+    if (!emitFn) return { ok: false, error: 'emit_not_wired', status: 500 };
+    const request_id = crypto.randomUUID();
+    const sent = emitFn(app_source, rdp_hostname, event, { ...payload, request_id });
+    if (!sent) return { ok: false, error: 'rdp_offline', detail: `no control socket for ${app_source}:${rdp_hostname}`, status: 502 };
+    try {
+        const result = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                pendingTgRequests.delete(request_id);
+                reject({ code: 'rdp_timeout', detail: `${timeout_ms}ms no response` });
+            }, timeout_ms);
+            pendingTgRequests.set(request_id, { resolve, reject, timer });
+        });
+        return { ok: true, result };
+    } catch (err) {
+        const code = err.code || 'client_error';
+        const status = code === 'rdp_timeout' ? 504 : 502;
+        return { ok: false, error: code, detail: err.detail, status };
+    }
+}
 
 // ==========================================================
 // Middleware — loopback + Bearer auth
@@ -156,25 +203,21 @@ router.post('/account/delete', async (req, res) => {
         return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
     }
 
-    // Audit the delete request (persisted even though Sprint 2e completes it).
-    // result enum is success|denied|error|rejected — use 'success' with note in error_message.
+    // Sprint 2e (v4.3.8): round-trip to clientapp control socket.
+    const rt = await callClientapp(rdp_hostname, 'tg:account_delete', { alias });
+    const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
+    const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
     try {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, '/delete', `${alias}@${rdp_hostname}`, 'success', 'sprint2b_scaffold_queued']
+            [String(operator_chat_id), scopeCheck.role, '/delete', `${alias}@${rdp_hostname}`, auditResult, auditMsg]
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
     }
-
-    // Sprint 2b scaffold — Phase 2e wires actual socket emit to clientapp
-    return res.status(501).json({
-        status: 'not_implemented_yet',
-        detail: 'Backend auth + scope OK. Clientapp support coming Sprint 2e.',
-        received: { alias, rdp_hostname, operator_chat_id },
-        scope: scopeCheck
-    });
+    if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
+    return res.json({ ok: true, ...rt.result });
 });
 
 // POST /api/tg/account/add
@@ -226,24 +269,24 @@ router.post('/account/add', async (req, res) => {
         return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
     }
 
-    // Audit the add request. password + pair_code values NEVER in args (sensitive).
-    // device_ip IS logged — it's a routing identifier, not a secret.
+    // Sprint 2e (v4.3.8): round-trip to clientapp — clientapp runs adb pair + DB insert.
+    const rt = await callClientapp(rdp_hostname, 'tg:account_create', {
+        alias, password, callback_url, device_ip, pair_code
+    });
+    const auditArgs = `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`;
+    const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
+    const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
     try {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d2_scaffold_queued']
+            [String(operator_chat_id), scopeCheck.role, '/add', auditArgs, auditResult, auditMsg]
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
     }
-
-    return res.status(501).json({
-        status: 'not_implemented_yet',
-        detail: 'Backend auth + scope + field validation OK. Clientapp support (adb pair relay + DB insert) coming Sprint 2e.',
-        received: { alias, rdp_hostname, callback_url, device_ip, operator_chat_id },
-        scope: scopeCheck
-    });
+    if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
+    return res.json({ ok: true, ...rt.result });
 });
 
 // POST /api/tg/account/edit
@@ -295,23 +338,22 @@ router.post('/account/edit', async (req, res) => {
         return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
     }
 
-    // Audit the edit request (value masked for sensitive fields).
+    // Sprint 2e (v4.3.8): round-trip to clientapp — clientapp updates account row + bumps updated_at.
+    const rt = await callClientapp(rdp_hostname, 'tg:account_edit', { alias, field, value });
+    const auditArgsStr = maskedArgs(alias, rdp_hostname, field, value);
+    const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
+    const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
     try {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, '/edit', maskedArgs(alias, rdp_hostname, field, value), 'success', 'sprint2c_scaffold_queued']
+            [String(operator_chat_id), scopeCheck.role, '/edit', auditArgsStr, auditResult, auditMsg]
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
     }
-
-    return res.status(501).json({
-        status: 'not_implemented_yet',
-        detail: 'Backend auth + scope + field whitelist OK. Clientapp support coming Sprint 2e.',
-        received: { alias, rdp_hostname, field, operator_chat_id },
-        scope: scopeCheck
-    });
+    if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
+    return res.json({ ok: true, ...rt.result });
 });
 
-module.exports = { router, setDb };
+module.exports = { router, setDb, setEmitter, resolveAck };
