@@ -2,6 +2,28 @@
 // B2.5 locked 2026-11-22 — asymmetric owner monitoring
 // - Owner tau SEMUA operator command (default ON)
 // - Owner chat TIDAK di-forward ke operator (asymmetric, enforced here)
+//
+// Sprint 2a (F2): rate limit batching — cooldown + accumulate dropped count.
+// If operator spams within COOLDOWN_MS, drops are counted and appended to next
+// normal send as "(+N prior rate-limited)".
+
+const { escapeHtml } = require('./util');
+
+const COOLDOWN_MS = parseInt(process.env.TG_SHADOW_COOLDOWN_MS || '2000', 10);
+const operatorRateState = new Map(); // chat_id → { lastSentAt, droppedCount, firstDropAt }
+
+// Periodic purge of idle state (every 60s, drop entries idle > 5 min with no pending drops)
+const PURGE_INTERVAL_MS = 60 * 1000;
+const PURGE_IDLE_MS = 5 * 60 * 1000;
+const purgeTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, state] of operatorRateState) {
+        if (state.droppedCount === 0 && (now - state.lastSentAt) > PURGE_IDLE_MS) {
+            operatorRateState.delete(key);
+        }
+    }
+}, PURGE_INTERVAL_MS);
+if (purgeTimer.unref) purgeTimer.unref();
 
 /**
  * Format timestamp for shadow message (WIB).
@@ -52,18 +74,44 @@ async function forwardToOwner({ ctx, operatorChatId, operatorLabel, cmd, result,
     // Asymmetric enforcement: never forward to anyone BUT owner
     if (String(operatorChatId) === String(ownerChatId)) return; // self — skip
 
+    // F2 rate limit: cooldown + accumulate
+    // ONLY 'error' events bypass cooldown (genuine backend/bot failures — rare + informative).
+    // 'denied' events respect cooldown — F1 mini-scan Sprint 2a fix: rogue operator spamming
+    // owner-only commands (e.g. /approve_rdp x y z) would otherwise flood owner unthrottled.
+    const bypassCooldown = (eventType === 'error');
+    const key = String(operatorChatId);
+    const now = Date.now();
+    let state = operatorRateState.get(key);
+    if (!state) {
+        state = { lastSentAt: 0, droppedCount: 0, firstDropAt: 0 };
+        operatorRateState.set(key, state);
+    }
+    if (!bypassCooldown && (now - state.lastSentAt) < COOLDOWN_MS) {
+        // Within cooldown — drop + accumulate for next flush
+        if (state.droppedCount === 0) state.firstDropAt = now;
+        state.droppedCount++;
+        return;
+    }
+
     const icon = eventType === 'error' ? '🔴' : (eventType === 'denied' ? '🚫' : (eventType === 'destructive' ? '⚠️' : '👁'));
-    const { escapeHtml } = require('./util');
-    const text = [
+    const lines = [
         `${icon} <b>Shadow: operator activity</b>`,
         `👤 ${escapeHtml(operatorLabel)} (chat ${escapeHtml(operatorChatId)})`,
         `💬 <code>${escapeHtml(cmd)}</code>`,
         `→ ${escapeHtml(result)}`,
         `⏱ ${escapeHtml(nowWIB())}`
-    ].join('\n');
+    ];
+    // Append batch summary if prior drops accumulated
+    if (state.droppedCount > 0) {
+        const windowSec = Math.round((now - state.firstDropAt) / 1000);
+        lines.push(`<i>(+${state.droppedCount} prior command${state.droppedCount === 1 ? '' : 's'} rate-limited in last ${windowSec}s)</i>`);
+        state.droppedCount = 0;
+        state.firstDropAt = 0;
+    }
 
+    state.lastSentAt = now;
     try {
-        await ctx.telegram.sendMessage(ownerChatId, text, { parse_mode: 'HTML' });
+        await ctx.telegram.sendMessage(ownerChatId, lines.join('\n'), { parse_mode: 'HTML' });
     } catch (e) {
         console.error('[shadow] forward failed:', e.message);
     }
@@ -91,7 +139,6 @@ async function notifyOwnerDenied(ctx, cmd) {
 async function notifyOwnerUnknown(ctx, cmd) {
     const ownerChatId = process.env.OWNER_CHAT_ID;
     if (!ownerChatId) return;
-    const { escapeHtml } = require('./util');
     const from = ctx.message?.from;
     const label = from ? `${from.first_name || '?'}${from.username ? ' @' + from.username : ''}` : '?';
     const text = [

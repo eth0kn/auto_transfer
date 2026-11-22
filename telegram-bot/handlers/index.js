@@ -2,9 +2,11 @@
 // Maps commands to handlers with role enforcement
 
 const { requireRole } = require('../middleware');
+const { escapeHtml } = require('../util');
 const pub = require('./public');
 const op = require('./operator');
 const own = require('./owner');
+const wiz = require('./wizard');
 
 /**
  * Register all handlers on a telegraf bot instance.
@@ -18,6 +20,7 @@ function registerHandlers(bot) {
     // OPERATOR_ALLOWED (operator + owner)
     bot.command('list', requireRole(['owner', 'operator']), op.handleList);
     bot.command('status', requireRole(['owner', 'operator']), op.handleStatus);
+    bot.command('cancel', requireRole(['owner', 'operator']), wiz.handleCancel);
 
     // OWNER_ONLY — RDP mgmt
     bot.command('list_rdp', requireRole(['owner']), own.handleListRdp);
@@ -34,16 +37,24 @@ function registerHandlers(bot) {
     bot.command('shadow', requireRole(['owner']), own.handleShadow);
     bot.command('audit', requireRole(['owner']), own.handleAudit);
 
-    // Catch-all for unknown commands (text that starts with /)
+    // Catch-all for non-command text + unknown commands
+    // Non-command text → route to active wizard step (if any)
+    // Unknown /command → helpful hint
     bot.on('text', async (ctx) => {
         const text = ctx.message?.text || '';
+        const r = ctx.state.role;
+        if (!r || r.role === 'rejected') return; // middleware already handled
+
         if (text.startsWith('/')) {
-            const r = ctx.state.role;
-            if (r.role === 'rejected') return; // middleware already replied
-            const { escapeHtml } = require('../util');
             await ctx.reply(`❓ Unknown command: <code>${escapeHtml(text.split(' ')[0])}</code>\n\nUse <code>/help</code> to see available commands.`, { parse_mode: 'HTML' });
+            return;
         }
-        // non-command text (plain message) — ignore for now, Sprint 2 wizard will handle
+
+        // Non-command text — route through wizard router first
+        const handled = await wiz.routeWizardText(ctx);
+        if (handled) return;
+
+        // No wizard active + non-command — silent ignore (Sprint 1 behavior preserved)
     });
 }
 

@@ -203,6 +203,8 @@ async function handleRevokeOperator(ctx) {
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'error', error_message: 'not_found' });
             return;
         }
+        // F3 mini-scan Sprint 2a fix: cascade cleanup wizard state for revoked operator
+        await pool.execute(`DELETE FROM wizard_sessions WHERE chat_id = ?`, [chatId]);
         await ctx.reply(`🚫 Operator <code>${escapeHtml(chatId)}</code> revoked.\n\n<i>D5: Sprint 3 will enforce kick + stop running bots. Sprint 1 only marks DB.</i>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'success' });
     } catch (e) {
@@ -233,6 +235,8 @@ async function handleDeleteOperator(ctx) {
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete_operator', args: chatId, result: 'error', error_message: 'not_found' });
             return;
         }
+        // F3 mini-scan Sprint 2a fix: cascade cleanup wizard state for deleted operator
+        await pool.execute(`DELETE FROM wizard_sessions WHERE chat_id = ?`, [chatId]);
         await ctx.reply(`🗑️ Operator <code>${escapeHtml(chatId)}</code> hard-deleted.`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete_operator', args: chatId, result: 'success' });
     } catch (e) {

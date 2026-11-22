@@ -90,6 +90,9 @@ async function handleHelp(ctx) {
             `• <code>/shadow on|off|filter &lt;level&gt;</code> — control shadow forward`,
             `• <code>/audit [chat_id] [limit]</code> — view audit log`,
             ``,
+            `<b>Wizard</b>`,
+            `• <code>/cancel</code> — abort active wizard`,
+            ``,
             `<i>Sprint 2+ (coming): /add /edit /delete /start_bot /stop_bot</i>`
         ].join('\n');
     } else if (r.role === 'operator') {
@@ -99,6 +102,7 @@ async function handleHelp(ctx) {
             `• <code>/whoami</code> — your role info`,
             `• <code>/list</code> — list your accessible accounts (coming Sprint 2)`,
             `• <code>/status</code> — RDP + bot health (coming Sprint 2)`,
+            `• <code>/cancel</code> — abort active wizard`,
             ``,
             `<i>Sprint 2+ (coming): /add /edit /delete /start_bot /stop_bot</i>`,
             `<i>Contact owner if you need more access.</i>`
