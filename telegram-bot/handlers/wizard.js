@@ -45,6 +45,12 @@ async function routeWizardText(ctx) {
         return await handleEditValueInput(ctx, active);
     }
 
+    // Sprint 2d-1: /add wizard ask_<field> steps
+    if (active.wizard_type === 'add' && typeof active.step === 'string' && active.step.startsWith('ask_')) {
+        const { handleAddValueInput } = require('./operator');
+        return await handleAddValueInput(ctx, active);
+    }
+
     // Unknown wizard/step — stub reply for future sprints
     await ctx.reply(
         `⏳ Wizard <code>${escapeHtml(active.wizard_type)}</code> step <code>${escapeHtml(active.step)}</code> — handler not implemented yet.\n\nUse <code>/cancel</code> to exit.`,

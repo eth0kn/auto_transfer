@@ -31,6 +31,46 @@ function maskForDisplay(field, value) {
     return value.length > 60 ? value.slice(0, 57) + '...' : value;
 }
 
+// Sprint 2d-1: /add wizard field progression + validation
+// Each step collects one field in state_json.data, keyed below.
+// SENSITIVE_ADD_FIELDS are masked in confirm message + never in audit args.
+const ADD_STEPS = [
+    { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (A-Z 0-9 _ - . only, ≤64 chars):' },
+    { key: 'username',     label: 'Username',     prompt: 'Send the <b>username</b> for BRImo login:' },
+    { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> for BRImo login.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
+    { key: 'callback_url', label: 'Callback URL', prompt: 'Send the <b>callback URL</b> (http:// or https://):' },
+    { key: 'api_key',      label: 'API Key',      prompt: 'Send the <b>API key</b>.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
+];
+const SENSITIVE_ADD_FIELDS = new Set(['password', 'api_key']);
+const ALIAS_REGEX = /^[A-Za-z0-9_\-.]+$/;
+const URL_REGEX   = /^https?:\/\/.+/i;
+
+function validateAddField(key, value) {
+    if (typeof value !== 'string' || !value.length) return { ok: false, error: 'empty' };
+    if (value.length > 2048) return { ok: false, error: 'too_long' };
+    if (key === 'alias') {
+        if (value.length > 64) return { ok: false, error: 'alias_too_long_64' };
+        if (!ALIAS_REGEX.test(value)) return { ok: false, error: 'alias_bad_chars' };
+    } else if (key === 'callback_url') {
+        if (!URL_REGEX.test(value)) return { ok: false, error: 'url_bad_scheme' };
+    } else if (value.length > 1024) {
+        return { ok: false, error: 'too_long_1024' };
+    }
+    return { ok: true };
+}
+
+function maskAddForDisplay(key, value) {
+    if (SENSITIVE_ADD_FIELDS.has(key)) return '••••••••';
+    if (typeof value !== 'string') return '-';
+    return value.length > 80 ? value.slice(0, 77) + '...' : value;
+}
+
+function nextAddStep(currentKey) {
+    const idx = ADD_STEPS.findIndex(s => s.key === currentKey);
+    if (idx < 0 || idx >= ADD_STEPS.length - 1) return null; // last field — go to confirm
+    return ADD_STEPS[idx + 1];
+}
+
 async function handleList(ctx) {
     const r = ctx.state.role;
     // Sprint 1: simplified stub — just confirm command received + list operator scope
@@ -491,8 +531,277 @@ async function handleEditCancelAction(ctx) {
     await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:cancel', args: active?.data ? `${active.data.alias}@${active.data.rdp_hostname}` : null, result: 'success' });
 }
 
+// ==========================================================
+// /add — Sprint 2d-1
+// Wizard flow: pick_rdp → ask_alias → ask_username → ask_password → ask_callback_url → ask_api_key → confirm → POST
+// ==========================================================
+
+async function handleAdd(ctx) {
+    const r = ctx.state.role;
+    if (ctx.message?.text && ctx.message.text.trim().split(/\s+/).length > 1) {
+        await ctx.reply(
+            'Usage: <code>/add</code> (no args — wizard asks each field in turn).\n\n<i>Fields: alias, username, password, callback_url, api_key.</i>',
+            { parse_mode: 'HTML' }
+        );
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add', result: 'rejected', error_message: 'unexpected_args' });
+        return;
+    }
+
+    // Scope-filtered RDP list
+    let rdps;
+    try {
+        [rdps] = await pool.execute(
+            `SELECT rdp_hostname FROM rdp_registry WHERE status = 'approved' ORDER BY rdp_hostname`
+        );
+    } catch (e) {
+        await ctx.reply(`❌ Error listing RDPs: ${escapeHtml(e.message)}`, { parse_mode: 'HTML' });
+        return;
+    }
+    let inScope = rdps.map(x => x.rdp_hostname);
+    if (r.role === 'operator') {
+        const allowed = r.operator?.allowed_rdp_hostnames;
+        if (allowed) {
+            let allowedList;
+            try { allowedList = typeof allowed === 'string' ? JSON.parse(allowed) : allowed; } catch { allowedList = []; }
+            inScope = inScope.filter(h => Array.isArray(allowedList) && allowedList.includes(h));
+        }
+    }
+    if (inScope.length === 0) {
+        await ctx.reply('❌ No approved RDPs in your scope. Contact owner.', { parse_mode: 'HTML' });
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add', result: 'rejected', error_message: 'no_rdp_in_scope' });
+        return;
+    }
+    // Telegram callback_data cap 64 bytes — hostnames should fit comfortably ('add_rdp:' + 56)
+    const buttons = inScope.slice(0, 20).map(h => ([
+        { text: h, callback_data: `add_rdp:${h.slice(0, 55)}` }
+    ]));
+    buttons.push([{ text: '❌ Cancel', callback_data: 'add_cancel' }]);
+
+    try {
+        await startWizard(r.chat_id, 'add', 'pick_rdp', {});
+    } catch (e) {
+        await ctx.reply(`❌ Error starting wizard: ${escapeHtml(e.message)}`, { parse_mode: 'HTML' });
+        return;
+    }
+    await ctx.reply(
+        `➕ <b>Add new account</b>\n\n` +
+        `Pick target RDP (${inScope.length} in scope):`,
+        {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        }
+    );
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add', result: 'success', error_message: 'wizard_started' });
+}
+
+async function handleAddRdpPick(ctx) {
+    const r = ctx.state.role;
+    const rdpHostname = ctx.match[1];
+    const active = await getActiveWizard(r.chat_id);
+    if (!active || active.wizard_type !== 'add' || active.step !== 'pick_rdp') {
+        await ctx.answerCbQuery('⏱ Session expired. Start again with /add.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Wizard expired or already handled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+    // Re-verify scope at click time (operator's allowed list may have changed)
+    if (r.role === 'operator') {
+        const allowed = r.operator?.allowed_rdp_hostnames;
+        if (allowed) {
+            let allowedList;
+            try { allowedList = typeof allowed === 'string' ? JSON.parse(allowed) : allowed; } catch { allowedList = []; }
+            if (!Array.isArray(allowedList) || !allowedList.includes(rdpHostname)) {
+                await ctx.answerCbQuery('🚫 Not in your scope.', { show_alert: true });
+                return;
+            }
+        }
+    }
+    try {
+        await advanceWizard(r.chat_id, 'ask_alias', { rdp_hostname: rdpHostname }, 'pick_rdp');
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    try {
+        await ctx.editMessageText(
+            `➕ <b>Add new account</b>\n\n` +
+            `RDP: <code>${escapeHtml(rdpHostname)}</code>\n\n` +
+            ADD_STEPS[0].prompt +
+            `\n\n<i>Or /cancel to abort.</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery(`RDP: ${rdpHostname}`);
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add:pick_rdp', args: rdpHostname, result: 'success' });
+}
+
+/**
+ * Called from wizard text router when wizard_type='add' and step starts with 'ask_'.
+ * Validates + advances to next step (or confirm after last field).
+ */
+async function handleAddValueInput(ctx, active) {
+    const r = ctx.state.role;
+    const value = (ctx.message?.text || '').trim();
+    const stepKey = active.step.replace(/^ask_/, ''); // 'ask_alias' → 'alias'
+    const stepDef = ADD_STEPS.find(s => s.key === stepKey);
+    if (!stepDef) {
+        await ctx.reply(`❌ Unexpected step: ${escapeHtml(active.step)}. Use /cancel.`, { parse_mode: 'HTML' });
+        return true;
+    }
+
+    const check = validateAddField(stepKey, value);
+    if (!check.ok) {
+        const msgs = {
+            empty: 'Empty value.',
+            too_long: 'Too long.',
+            too_long_1024: 'Too long (max 1024).',
+            alias_too_long_64: 'Alias too long (max 64 chars).',
+            alias_bad_chars: 'Alias chars must be A-Z 0-9 _ - . only.',
+            url_bad_scheme: 'Callback URL must start with http:// or https://.'
+        };
+        await ctx.reply(`❌ ${msgs[check.error] || check.error}\n\nSend the value again or /cancel.`, { parse_mode: 'HTML' });
+        return true;
+    }
+
+    const next = nextAddStep(stepKey);
+    const mergeData = { [stepKey]: value };
+    try {
+        if (next) {
+            await advanceWizard(r.chat_id, `ask_${next.key}`, mergeData, active.step);
+        } else {
+            await advanceWizard(r.chat_id, 'confirm', mergeData, active.step);
+        }
+    } catch (_) {
+        await ctx.reply('⏱ Wizard expired. Start again with /add.', { parse_mode: 'HTML' });
+        return true;
+    }
+
+    if (next) {
+        await ctx.reply(next.prompt + `\n\n<i>Or /cancel to abort.</i>`, { parse_mode: 'HTML' });
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/add:ask_${stepKey}`, args: SENSITIVE_ADD_FIELDS.has(stepKey) ? '***' : value.slice(0, 40), result: 'success' });
+        return true;
+    }
+
+    // All fields collected — show confirm page
+    const merged = { ...active.data, ...mergeData };
+    const lines = [
+        `⚠️ <b>Confirm new account</b>`,
+        ``,
+        `RDP: <code>${escapeHtml(merged.rdp_hostname)}</code>`,
+        `Alias: <code>${escapeHtml(merged.alias)}</code>`,
+        `Username: <code>${escapeHtml(merged.username)}</code>`,
+        `Password: <code>${escapeHtml(maskAddForDisplay('password', merged.password))}</code>`,
+        `Callback URL: <code>${escapeHtml(maskAddForDisplay('callback_url', merged.callback_url))}</code>`,
+        `API Key: <code>${escapeHtml(maskAddForDisplay('api_key', merged.api_key))}</code>`,
+        ``,
+        `<i>Account will be created on the target RDP.</i>`
+    ];
+    await ctx.reply(lines.join('\n'), {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [[
+                { text: '✅ YES, create', callback_data: 'add_confirm:ok' },
+                { text: '❌ Cancel', callback_data: 'add_confirm:no' }
+            ]]
+        }
+    });
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add:confirm_prompt', args: `${merged.alias}@${merged.rdp_hostname}`, result: 'success' });
+    return true;
+}
+
+async function handleAddConfirm(ctx) {
+    const r = ctx.state.role;
+    const decision = ctx.match[1]; // 'ok' | 'no'
+    const active = await getActiveWizard(r.chat_id);
+    if (!active || active.wizard_type !== 'add' || active.step !== 'confirm') {
+        await ctx.answerCbQuery('⏱ Session expired or already handled.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Wizard expired or already handled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+
+    if (decision === 'no') {
+        await cancelWizard(r.chat_id);
+        try { await ctx.editMessageText('❌ <i>Add canceled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        await ctx.answerCbQuery('Canceled.');
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add:cancel', args: `${active.data.alias}@${active.data.rdp_hostname}`, result: 'success' });
+        return;
+    }
+
+    // Atomic CAS lock — prevent double-click destructive call (same F1 pattern as /edit)
+    try {
+        await advanceWizard(r.chat_id, 'applying', {}, 'confirm');
+    } catch (_) {
+        await ctx.answerCbQuery('⏳ Already processing.', { show_alert: false });
+        return;
+    }
+
+    const { alias, rdp_hostname, username, password, callback_url, api_key } = active.data;
+    const resp = await postJson('/account/add', {
+        alias, rdp_hostname, username, password, callback_url, api_key,
+        operator_chat_id: r.chat_id
+    });
+
+    let replyText, auditResult, auditErrMsg = null;
+    if (resp.ok) {
+        replyText = `✅ Account created.\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code>`;
+        auditResult = 'success';
+    } else if (resp.status === 501) {
+        replyText = `⚠️ <b>Scaffold accepted</b>\n\nBackend auth+scope+validation OK.\nClientapp support coming Sprint 2e.\n\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code>\n\n<i>Status 501: ${escapeHtml(resp.data?.detail || 'not implemented')}</i>`;
+        auditResult = 'success';
+        auditErrMsg = 'sprint2d1_scaffold_queued';
+    } else if (resp.status === 403) {
+        replyText = `❌ Scope denied: ${escapeHtml(resp.data?.detail || 'unknown')}`;
+        auditResult = 'denied';
+        auditErrMsg = resp.data?.detail || 'scope_denied';
+    } else if (resp.status === 400) {
+        replyText = `❌ Invalid: ${escapeHtml(resp.data?.detail || resp.data?.error || 'bad_request')}`;
+        auditResult = 'rejected';
+        auditErrMsg = resp.data?.error || 'bad_request';
+    } else {
+        replyText = `❌ Backend error ${resp.status}: ${escapeHtml(JSON.stringify(resp.data).slice(0, 200))}`;
+        auditResult = 'error';
+        auditErrMsg = `http_${resp.status}`;
+    }
+
+    try { await ctx.editMessageText(replyText, { parse_mode: 'HTML' }); }
+    catch (_) { await ctx.reply(replyText, { parse_mode: 'HTML' }); }
+    await ctx.answerCbQuery();
+
+    await logAudit({
+        chat_id: r.chat_id,
+        role: r.role,
+        cmd: '/add:confirm',
+        args: `${alias}@${rdp_hostname} user=${username.slice(0, 40)}`,
+        result: auditResult,
+        error_message: auditErrMsg
+    });
+
+    if (r.role === 'operator') {
+        await forwardToOwner({
+            ctx,
+            operatorChatId: r.chat_id,
+            operatorLabel: r.operator?.display_name || 'operator',
+            cmd: '/add',
+            result: `${alias}@${rdp_hostname} → ${auditResult}`,
+            eventType: resp.ok || resp.status === 501 ? 'destructive' : 'error'
+        });
+    }
+    await cancelWizard(r.chat_id);
+}
+
+async function handleAddCancelAction(ctx) {
+    const r = ctx.state.role;
+    const active = await getActiveWizard(r.chat_id);
+    if (active && active.wizard_type === 'add') {
+        await cancelWizard(r.chat_id);
+    }
+    try { await ctx.editMessageText('❌ <i>Add canceled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+    await ctx.answerCbQuery('Canceled.');
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add:cancel', args: active?.data?.rdp_hostname || null, result: 'success' });
+}
+
 module.exports = {
     handleList, handleStatus,
     handleDelete, handleDeleteConfirm, handleDeleteCancel,
-    handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction
+    handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction,
+    handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction
 };

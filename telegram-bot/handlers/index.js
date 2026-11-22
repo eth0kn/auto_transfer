@@ -23,6 +23,7 @@ function registerHandlers(bot) {
     bot.command('cancel', requireRole(['owner', 'operator']), wiz.handleCancel);
     bot.command('delete', requireRole(['owner', 'operator']), op.handleDelete);
     bot.command('edit',   requireRole(['owner', 'operator']), op.handleEdit);
+    bot.command('add',    requireRole(['owner', 'operator']), op.handleAdd);
 
     // Sprint 2b: inline-button callbacks for /delete confirm flow
     // Pattern: del_ok:<cbid> and del_no:<cbid>, cbid = 12 hex chars
@@ -33,6 +34,12 @@ function registerHandlers(bot) {
     bot.action(/^edit_field:(username|password|callback_url|api_key)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
     bot.action(/^edit_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleEditConfirm);
     bot.action(/^edit_cancel$/, requireRole(['owner', 'operator']), op.handleEditCancelAction);
+
+    // Sprint 2d-1: /add wizard inline-button callbacks
+    // add_rdp:<hostname> — hostname pattern loose (any safe chars); backend re-validates scope.
+    bot.action(/^add_rdp:([A-Za-z0-9._\-]{1,55})$/, requireRole(['owner', 'operator']), op.handleAddRdpPick);
+    bot.action(/^add_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleAddConfirm);
+    bot.action(/^add_cancel$/, requireRole(['owner', 'operator']), op.handleAddCancelAction);
 
     // OWNER_ONLY — RDP mgmt
     bot.command('list_rdp', requireRole(['owner']), own.handleListRdp);

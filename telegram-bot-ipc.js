@@ -161,6 +161,68 @@ router.post('/account/delete', async (req, res) => {
     });
 });
 
+// POST /api/tg/account/add
+// Body: { alias, rdp_hostname, username, password, callback_url, api_key, operator_chat_id }
+// Response Sprint 2d-1: 501 — clientapp support coming Sprint 2e
+router.post('/account/add', async (req, res) => {
+    const { alias, rdp_hostname, username, password, callback_url, api_key, operator_chat_id } = req.body || {};
+    const missing = [];
+    if (!alias) missing.push('alias');
+    if (!rdp_hostname) missing.push('rdp_hostname');
+    if (!username) missing.push('username');
+    if (!password) missing.push('password');
+    if (!callback_url) missing.push('callback_url');
+    if (!api_key) missing.push('api_key');
+    if (!operator_chat_id) missing.push('operator_chat_id');
+    if (missing.length) {
+        return res.status(400).json({ error: 'missing_fields', detail: `required: ${missing.join(', ')}` });
+    }
+
+    // Length + format guards (defense in depth against bot-side slip-through)
+    if (typeof alias !== 'string' || alias.length > 64 || !/^[A-Za-z0-9_\-.]+$/.test(alias)) {
+        return res.status(400).json({ error: 'invalid_alias', detail: 'A-Z 0-9 _ - . only, ≤64 chars' });
+    }
+    for (const [k, v] of [['username', username], ['password', password], ['api_key', api_key]]) {
+        if (typeof v !== 'string' || !v.length || v.length > 1024) {
+            return res.status(400).json({ error: `invalid_${k}`, detail: `${k} must be non-empty string ≤1024 chars` });
+        }
+    }
+    if (typeof callback_url !== 'string' || !/^https?:\/\/.+/i.test(callback_url) || callback_url.length > 2048) {
+        return res.status(400).json({ error: 'invalid_callback_url', detail: 'must be http(s)://... ≤2048 chars' });
+    }
+
+    // Validate scope
+    const scopeCheck = await validateOperatorScope(operator_chat_id, rdp_hostname);
+    if (!scopeCheck.ok) {
+        try {
+            await pool.execute(
+                `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [String(operator_chat_id), 'unknown', '/add', `${alias}@${rdp_hostname}`, 'denied', scopeCheck.error]
+            );
+        } catch (_) { /* non-blocking */ }
+        return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
+    }
+
+    // Audit the add request (password + api_key values NEVER go in args — masked).
+    try {
+        await pool.execute(
+            `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} user=${username.slice(0, 40)} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d1_scaffold_queued']
+        );
+    } catch (e) {
+        console.error('[TG-IPC] audit insert failed:', e.message);
+    }
+
+    return res.status(501).json({
+        status: 'not_implemented_yet',
+        detail: 'Backend auth + scope + field validation OK. Clientapp support coming Sprint 2e.',
+        received: { alias, rdp_hostname, username, callback_url, operator_chat_id },
+        scope: scopeCheck
+    });
+});
+
 // POST /api/tg/account/edit
 // Body: { alias, rdp_hostname, field, value, operator_chat_id }
 // Response Sprint 2c: 501 — clientapp support coming Sprint 2e
