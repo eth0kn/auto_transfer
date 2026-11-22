@@ -1584,6 +1584,19 @@ function setupBotNamespace(app_source) {
             catch (e) { console.error('[tg-ctrl] devices_ack resolveAck threw:', e.message); }
         });
 
+        // Sprint 3 (v4.3.10): ack dispatch for fan-out alias lookup (/account/alias_lookup
+        // + /edit + /delete + /bot/start + /bot/stop when rdp_hostname omitted).
+        socket.on('tg:alias_lookup_ack', (payload) => {
+            try { tgIpc.resolveAck(payload); }
+            catch (e) { console.error('[tg-ctrl] alias_lookup_ack resolveAck threw:', e.message); }
+        });
+
+        // Sprint 3 (v4.3.10): ack dispatch for /bot/start + /bot/stop runtime control.
+        socket.on('tg:bot_control_ack', (payload) => {
+            try { tgIpc.resolveAck(payload); }
+            catch (e) { console.error('[tg-ctrl] bot_control_ack resolveAck threw:', e.message); }
+        });
+
         socket.on('disconnect', async (reason) => {
             // Sprint 2e (v4.3.8): control-plane socket cleanup. Runs first — control sockets
             // don't have bot_id so the bot cleanup path below short-circuits for them.

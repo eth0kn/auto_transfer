@@ -24,6 +24,9 @@ function registerHandlers(bot) {
     bot.command('delete', requireRole(['owner', 'operator']), op.handleDelete);
     bot.command('edit',   requireRole(['owner', 'operator']), op.handleEdit);
     bot.command('add',    requireRole(['owner', 'operator']), op.handleAdd);
+    // Sprint 3 (v4.3.10): runtime bot control + alias-only args retrofit
+    bot.command('start_bot', requireRole(['owner', 'operator']), op.handleStart);
+    bot.command('stop_bot',  requireRole(['owner', 'operator']), op.handleStop);
 
     // Sprint 2b: inline-button callbacks for /delete confirm flow
     // Pattern: del_ok:<cbid> and del_no:<cbid>, cbid = 12 hex chars
@@ -47,6 +50,10 @@ function registerHandlers(bot) {
     bot.action(/^add_rdp:([^\x00-\x1F\x7F]{1,55})$/, requireRole(['owner', 'operator']), op.handleAddRdpPick);
     bot.action(/^add_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleAddConfirm);
     bot.action(/^add_cancel$/, requireRole(['owner', 'operator']), op.handleAddCancelAction);
+
+    // Sprint 3 (v4.3.10): alias→RDP picker for /start /stop /edit /delete without rdp_hostname.
+    // callback_data: pick_rdp:<cbid=12hex>:<idx=0-9|cancel>
+    bot.action(/^pick_rdp:([0-9a-f]{12}):(\d|cancel)$/, requireRole(['owner', 'operator']), op.handlePickRdp);
 
     // OWNER_ONLY — RDP mgmt
     bot.command('list_rdp', requireRole(['owner']), own.handleListRdp);

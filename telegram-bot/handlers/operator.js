@@ -17,6 +17,60 @@ const { startWizard, getActiveWizard, advanceWizard, cancelWizard } = require('.
 const pendingDeletes = new Map();
 const PENDING_TTL_MS = 60 * 1000;
 
+// Sprint 3 (v4.3.10): pending alias→RDP picker when /start /stop /edit /delete
+// called WITHOUT rdp_hostname and fan-out resolution returns >1 hit.
+// key = 12-char hex cbid → { action, alias, candidates[], operator_chat_id, expires_at,
+//                            extra: {field?, value?, ...} for action-specific context }
+const pendingPickers = new Map();
+const PICKER_TTL_MS = 60 * 1000;
+
+/**
+ * Sprint 3 helper — resolve alias → RDP via fan-out. Returns:
+ *   - { rdp_hostname }                 // auto-resolved (1 hit) → caller proceeds
+ *   - { pickerShown: true }            // N>1 hit → picker message rendered, caller returns
+ *   - { error: 'not_found'|'...' }     // 0 hit / no scope → caller sends error reply
+ *
+ * `extraContext` is stashed in the picker's pending state so the pick callback
+ * can resume the original action with full args (e.g. field/value for /edit).
+ */
+async function resolveAliasOrPicker(ctx, action, alias, extraContext = {}) {
+    const r = ctx.state.role;
+    const resp = await getJson(`/account/alias_lookup?alias=${encodeURIComponent(alias)}&operator_chat_id=${encodeURIComponent(r.chat_id)}`);
+    if (!resp.ok) {
+        return { error: 'lookup_failed', detail: resp.data?.detail || `status ${resp.status}` };
+    }
+    const hits = Array.isArray(resp.data?.hits) ? resp.data.hits : [];
+    const scanned = resp.data?.scanned ?? 0;
+    if (scanned === 0) return { error: 'no_rdps_in_scope' };
+    if (hits.length === 0) return { error: 'alias_not_found', scanned };
+    if (hits.length === 1) return { rdp_hostname: hits[0].rdp_hostname, hit: hits[0] };
+
+    // Multi-hit → render picker
+    const cbid = crypto.randomBytes(6).toString('hex');
+    const expiresAt = Date.now() + PICKER_TTL_MS;
+    pendingPickers.set(cbid, {
+        action,
+        alias,
+        candidates: hits.slice(0, 10), // Telegram inline keyboard cap
+        operator_chat_id: r.chat_id,
+        expires_at: expiresAt,
+        extra: extraContext
+    });
+    setTimeout(() => pendingPickers.delete(cbid), PICKER_TTL_MS);
+
+    const buttons = hits.slice(0, 10).map((h, i) => ([
+        { text: `${h.rdp_hostname} (${h.device_id || 'no-device'})`, callback_data: `pick_rdp:${cbid}:${i}` }
+    ]));
+    buttons.push([{ text: '❌ Cancel', callback_data: `pick_rdp:${cbid}:cancel` }]);
+    await ctx.reply(
+        `⚠️ <b>Alias ambiguous</b>\n\n` +
+        `Alias <code>${escapeHtml(alias)}</code> ditemukan di ${hits.length} RDP.\n` +
+        `Pilih yang mana untuk <b>/${escapeHtml(action)}</b>:`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }
+    );
+    return { pickerShown: true };
+}
+
 // Sprint 2c + v4.3.6 hotfix: /edit field whitelist aligned with clientapp DB schema.
 // Scanner report 2026-11-22: clientapp accounts table has NO username / api_key columns.
 // Login BRImo pakai password saja (alias cuma UI label).
@@ -201,17 +255,48 @@ async function handleDelete(ctx) {
     const r = ctx.state.role;
     const text = ctx.message?.text || '';
     const parts = text.trim().split(/\s+/);
-    if (parts.length < 3) {
+    // v4.3.10 Sprint 3: rdp_hostname OPTIONAL (alias-only mode).
+    // Operator policy: alias unique cross-RDP (not enforced by code).
+    if (parts.length < 2) {
         await ctx.reply(
-            'Usage: <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code>\n\nExample: <code>/delete fajar-brimo-01 RDP-TF-BRImo1</code>',
+            'Usage: <code>/delete &lt;alias&gt; [rdp_hostname]</code>\n\n' +
+            'Examples:\n' +
+            '• <code>/delete fajar-brimo-01</code> — auto-resolve RDP\n' +
+            '• <code>/delete fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', result: 'rejected', error_message: 'missing_args' });
         return;
     }
     const alias = parts[1];
-    const rdp_hostname = parts[2];
+    let rdp_hostname = parts[2]; // may be undefined
 
+    if (!rdp_hostname) {
+        const resolved = await resolveAliasOrPicker(ctx, 'delete', alias);
+        if (resolved.pickerShown) {
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', args: alias, result: 'success', error_message: 'picker_shown' });
+            return;
+        }
+        if (resolved.error) {
+            const msg = {
+                no_rdps_in_scope: 'Operator has no approved RDPs in scope.',
+                alias_not_found: `Alias <code>${escapeHtml(alias)}</code> not found${resolved.scanned ? ` in any of ${resolved.scanned} RDP(s)` : ''}.`,
+                lookup_failed: `Alias lookup failed: ${escapeHtml(resolved.detail || '?')}`
+            }[resolved.error] || `Error: ${escapeHtml(resolved.error)}`;
+            await ctx.reply(`❌ ${msg}`, { parse_mode: 'HTML' });
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', args: alias, result: 'rejected', error_message: resolved.error });
+            return;
+        }
+        rdp_hostname = resolved.rdp_hostname;
+    }
+
+    return deleteShowConfirm(ctx, alias, rdp_hostname);
+}
+
+// Sprint 3 refactor: confirm-page rendering factored out so pick_rdp picker
+// can resume into it after resolving the ambiguous alias.
+async function deleteShowConfirm(ctx, alias, rdp_hostname) {
+    const r = ctx.state.role;
     // Generate short random callback id (6 bytes = 12 hex chars — fits callback_data 64-byte cap)
     const cbid = crypto.randomBytes(6).toString('hex');
     const expiresAt = Date.now() + PENDING_TTL_MS;
@@ -349,17 +434,47 @@ async function handleEdit(ctx) {
     const r = ctx.state.role;
     const text = ctx.message?.text || '';
     const parts = text.trim().split(/\s+/);
-    if (parts.length < 3) {
+    // v4.3.10 Sprint 3: rdp_hostname OPTIONAL.
+    if (parts.length < 2) {
         await ctx.reply(
-            'Usage: <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code>\n\nExample: <code>/edit fajar-brimo-01 RDP-TF-BRImo1</code>',
+            'Usage: <code>/edit &lt;alias&gt; [rdp_hostname]</code>\n\n' +
+            'Examples:\n' +
+            '• <code>/edit fajar-brimo-01</code> — auto-resolve RDP\n' +
+            '• <code>/edit fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit', result: 'rejected', error_message: 'missing_args' });
         return;
     }
     const alias = parts[1];
-    const rdp_hostname = parts[2];
+    let rdp_hostname = parts[2];
 
+    if (!rdp_hostname) {
+        const resolved = await resolveAliasOrPicker(ctx, 'edit', alias);
+        if (resolved.pickerShown) {
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit', args: alias, result: 'success', error_message: 'picker_shown' });
+            return;
+        }
+        if (resolved.error) {
+            const msg = {
+                no_rdps_in_scope: 'Operator has no approved RDPs in scope.',
+                alias_not_found: `Alias <code>${escapeHtml(alias)}</code> not found${resolved.scanned ? ` in any of ${resolved.scanned} RDP(s)` : ''}.`,
+                lookup_failed: `Alias lookup failed: ${escapeHtml(resolved.detail || '?')}`
+            }[resolved.error] || `Error: ${escapeHtml(resolved.error)}`;
+            await ctx.reply(`❌ ${msg}`, { parse_mode: 'HTML' });
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit', args: alias, result: 'rejected', error_message: resolved.error });
+            return;
+        }
+        rdp_hostname = resolved.rdp_hostname;
+    }
+
+    return editShowFieldPicker(ctx, alias, rdp_hostname);
+}
+
+// Sprint 3 refactor: field-picker rendering factored out so pick_rdp picker
+// can resume into it after resolving the ambiguous alias.
+async function editShowFieldPicker(ctx, alias, rdp_hostname) {
+    const r = ctx.state.role;
     try {
         await startWizard(r.chat_id, 'edit', 'pick_field', { alias, rdp_hostname });
     } catch (e) {
@@ -1035,10 +1150,179 @@ async function handleAddCancelAction(ctx) {
     await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add:cancel', args: active?.data?.rdp_hostname || null, result: 'success' });
 }
 
+// ==========================================================
+// /start + /stop — Sprint 3 (v4.3.10) runtime bot control
+// ==========================================================
+
+async function handleStart(ctx) { return handleStartStop(ctx, 'start'); }
+async function handleStop(ctx)  { return handleStartStop(ctx, 'stop'); }
+
+async function handleStartStop(ctx, action) {
+    const r = ctx.state.role;
+    const text = ctx.message?.text || '';
+    const parts = text.trim().split(/\s+/);
+    if (parts.length < 2) {
+        await ctx.reply(
+            `Usage: <code>/${action} &lt;alias&gt; [rdp_hostname]</code>\n\n` +
+            'Examples:\n' +
+            `• <code>/${action} fajar-brimo-01</code> — auto-resolve RDP\n` +
+            `• <code>/${action} fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing`,
+            { parse_mode: 'HTML' }
+        );
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${action}`, result: 'rejected', error_message: 'missing_args' });
+        return;
+    }
+    const alias = parts[1];
+    let rdp_hostname = parts[2];
+
+    if (!rdp_hostname) {
+        const resolved = await resolveAliasOrPicker(ctx, action, alias);
+        if (resolved.pickerShown) {
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${action}`, args: alias, result: 'success', error_message: 'picker_shown' });
+            return;
+        }
+        if (resolved.error) {
+            const msg = {
+                no_rdps_in_scope: 'Operator has no approved RDPs in scope.',
+                alias_not_found: `Alias <code>${escapeHtml(alias)}</code> not found${resolved.scanned ? ` in any of ${resolved.scanned} RDP(s)` : ''}.`,
+                lookup_failed: `Alias lookup failed: ${escapeHtml(resolved.detail || '?')}`
+            }[resolved.error] || `Error: ${escapeHtml(resolved.error)}`;
+            await ctx.reply(`❌ ${msg}`, { parse_mode: 'HTML' });
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${action}`, args: alias, result: 'rejected', error_message: resolved.error });
+            return;
+        }
+        rdp_hostname = resolved.rdp_hostname;
+    }
+
+    return startStopExecute(ctx, action, alias, rdp_hostname);
+}
+
+async function startStopExecute(ctx, action, alias, rdp_hostname) {
+    const r = ctx.state.role;
+    // Direct execute — no confirm step per D3=C1 (operator-tempo freq ops).
+    // Clientapp side: up to 15s wait for bot-started/-start-failed event (start),
+    // or immediate ack after engine.stop() flip (stop). Backend timeout 20s.
+    const typingMsg = await ctx.reply(action === 'start' ? '🟡 Starting bot...' : '🟡 Stopping bot...', { parse_mode: 'HTML' });
+    const resp = await postJson(`/bot/${action}`, { alias, rdp_hostname, operator_chat_id: r.chat_id });
+
+    let replyText, auditResult, auditErrMsg = null;
+    if (resp.ok) {
+        const state = resp.data?.bot_state || (action === 'start' ? 'running' : 'stopping');
+        const emoji = state === 'running' ? '✅' : (state === 'stopping' ? '🛑' : 'ℹ️');
+        replyText = `${emoji} <code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code> — <b>${escapeHtml(state)}</b>`;
+        auditResult = 'success';
+    } else if (resp.status === 403) {
+        replyText = `❌ Scope denied: ${escapeHtml(resp.data?.detail || 'unknown')}`;
+        auditResult = 'denied';
+        auditErrMsg = resp.data?.detail || 'scope_denied';
+    } else if (resp.status === 404) {
+        replyText = `❌ ${escapeHtml(resp.data?.detail || 'alias not found')}`;
+        auditResult = 'rejected';
+        auditErrMsg = 'alias_not_found';
+    } else if (resp.data?.error === 'already_running' || resp.data?.error === 'not_running') {
+        replyText = `ℹ️ <code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code> — ${escapeHtml(resp.data.error === 'already_running' ? 'already running' : 'not running')}`;
+        auditResult = 'rejected';
+        auditErrMsg = resp.data.error;
+    } else {
+        replyText = `❌ ${escapeHtml(resp.data?.error || 'error')}: ${escapeHtml(resp.data?.detail || `status ${resp.status}`)}`;
+        auditResult = 'error';
+        auditErrMsg = `http_${resp.status}`;
+    }
+
+    try {
+        await ctx.telegram.editMessageText(typingMsg.chat.id, typingMsg.message_id, undefined, replyText, { parse_mode: 'HTML' });
+    } catch (_) {
+        await ctx.reply(replyText, { parse_mode: 'HTML' });
+    }
+
+    await logAudit({
+        chat_id: r.chat_id, role: r.role, cmd: `/${action}`,
+        args: `${alias}@${rdp_hostname}`,
+        result: auditResult, error_message: auditErrMsg
+    });
+
+    if (r.role === 'operator') {
+        await forwardToOwner({
+            ctx,
+            operatorChatId: r.chat_id,
+            operatorLabel: r.operator?.display_name || 'operator',
+            cmd: `/${action}`,
+            result: `${alias}@${rdp_hostname} → ${auditResult}`,
+            eventType: resp.ok ? 'destructive' : 'error'
+        });
+    }
+}
+
+// ==========================================================
+// Alias-picker callback — Sprint 3 (v4.3.10)
+// Shared across /start /stop /edit /delete when alias resolves to multi-RDP.
+// callback_data format: pick_rdp:<cbid>:<idx>|cancel
+// ==========================================================
+
+async function handlePickRdp(ctx) {
+    const r = ctx.state.role;
+    const cbid = ctx.match[1];
+    const idxOrCancel = ctx.match[2];
+    const pending = pendingPickers.get(cbid);
+
+    if (!pending) {
+        await ctx.answerCbQuery('⏱ Expired or already handled.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Picker expired.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+    // Only original requester can pick
+    if (String(ctx.from?.id) !== String(pending.operator_chat_id)) {
+        await ctx.answerCbQuery('🚫 Not your picker.', { show_alert: true });
+        return;
+    }
+
+    if (idxOrCancel === 'cancel') {
+        pendingPickers.delete(cbid);
+        try { await ctx.editMessageText('❌ <i>Canceled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        await ctx.answerCbQuery('Canceled.');
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${pending.action}:pick_cancel`, args: pending.alias, result: 'success' });
+        return;
+    }
+
+    const idx = parseInt(idxOrCancel, 10);
+    const candidate = pending.candidates?.[idx];
+    if (!candidate) {
+        // Mini-scan G3 fix: drop pending entry on invalid idx to prevent zombie
+        // state (unreachable under current regex but defense-in-depth).
+        pendingPickers.delete(cbid);
+        await ctx.answerCbQuery('❌ Invalid choice.', { show_alert: true });
+        return;
+    }
+    pendingPickers.delete(cbid);
+    const rdp_hostname = candidate.rdp_hostname;
+    try {
+        await ctx.editMessageText(
+            `✅ Selected <code>${escapeHtml(rdp_hostname)}</code> — proceeding with <b>/${escapeHtml(pending.action)}</b>...`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery(`${rdp_hostname}`);
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${pending.action}:pick_rdp`, args: `${pending.alias}@${rdp_hostname}`, result: 'success' });
+
+    // Resume original action with resolved rdp_hostname
+    switch (pending.action) {
+        case 'start':
+        case 'stop':
+            return startStopExecute(ctx, pending.action, pending.alias, rdp_hostname);
+        case 'edit':
+            return editShowFieldPicker(ctx, pending.alias, rdp_hostname);
+        case 'delete':
+            return deleteShowConfirm(ctx, pending.alias, rdp_hostname);
+        default:
+            await ctx.reply(`❌ Unknown pending action: ${escapeHtml(pending.action)}`);
+    }
+}
+
 module.exports = {
     handleList, handleStatus,
     handleDelete, handleDeleteConfirm, handleDeleteCancel,
     handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction,
     handleEditDevicePick, handleEditDeviceManual,
-    handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction
+    handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction,
+    handleStart, handleStop, handlePickRdp
 };
