@@ -1039,6 +1039,12 @@ app.get('/api/bots', requireAuth, (req, res) => {
     res.json(bots);
 });
 
+// v4.3.2 Sprint 2b (2026-11-22): Telegram Bot IPC — loopback + Bearer auth
+// Module at ./telegram-bot-ipc.js; mounted here only to share app + pool.
+const tgIpc = require('./telegram-bot-ipc');
+tgIpc.setDb(pool);
+app.use('/api/tg', tgIpc.router);
+
 // v4.2.0 M6: GET /api/mirror/devices — device registry untuk mirror-proxy hub
 // Dual auth: cookie isLoggedIn (browser) OR X-Admin-Key header (mirror-proxy machine-to-machine)
 app.get('/api/mirror/devices', (req, res) => {

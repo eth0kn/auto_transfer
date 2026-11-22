@@ -21,6 +21,12 @@ function registerHandlers(bot) {
     bot.command('list', requireRole(['owner', 'operator']), op.handleList);
     bot.command('status', requireRole(['owner', 'operator']), op.handleStatus);
     bot.command('cancel', requireRole(['owner', 'operator']), wiz.handleCancel);
+    bot.command('delete', requireRole(['owner', 'operator']), op.handleDelete);
+
+    // Sprint 2b: inline-button callbacks for /delete confirm flow
+    // Pattern: del_ok:<cbid> and del_no:<cbid>, cbid = 12 hex chars
+    bot.action(/^del_ok:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteConfirm);
+    bot.action(/^del_no:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteCancel);
 
     // OWNER_ONLY — RDP mgmt
     bot.command('list_rdp', requireRole(['owner']), own.handleListRdp);

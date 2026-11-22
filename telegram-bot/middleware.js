@@ -8,29 +8,29 @@ const { pool } = require('./db');
 const { logAudit } = require('./audit');
 
 /**
- * Resolve role for incoming message.
+ * Resolve role for incoming update (message OR callback_query).
+ * Sprint 2b: callback_query support via unified ctx.from + ctx.chat.
  * Returns: { role, chat_id, operator?, reject_reason? }
  */
 async function resolveRole(ctx) {
-    const msg = ctx.message || ctx.update?.message || ctx.update?.edited_message;
-    if (!msg) {
-        return { role: 'rejected', reject_reason: 'no_message' };
-    }
-
-    // Tier 1 — Private chat only
-    if (msg.chat?.type !== 'private') {
-        return { role: 'rejected', reject_reason: 'group_chat_not_allowed', chat_id: String(msg.chat?.id || '') };
-    }
-
-    // Tier 2 — No forwarded commands
-    if (msg.forward_from || msg.forward_sender_name || msg.forward_from_chat) {
-        return { role: 'rejected', reject_reason: 'forwarded_not_allowed', chat_id: String(msg.from?.id || '') };
-    }
-
-    const chatId = String(msg.from?.id || '');
-    if (!chatId) {
+    const fromId = String(ctx.from?.id || '');
+    const chatType = ctx.chat?.type;
+    if (!fromId) {
         return { role: 'rejected', reject_reason: 'no_from_id' };
     }
+
+    // Tier 1 — Private chat only (applies to both messages AND callback_query)
+    if (chatType !== 'private') {
+        return { role: 'rejected', reject_reason: 'group_chat_not_allowed', chat_id: fromId };
+    }
+
+    // Tier 2 — No forwarded commands (messages only; callback_query has no forward concept)
+    const msg = ctx.message || ctx.update?.message || ctx.update?.edited_message;
+    if (msg && (msg.forward_from || msg.forward_sender_name || msg.forward_from_chat)) {
+        return { role: 'rejected', reject_reason: 'forwarded_not_allowed', chat_id: fromId };
+    }
+
+    const chatId = fromId;
 
     // Tier 3 — Owner hardcode check
     const ownerChatId = process.env.OWNER_CHAT_ID;
@@ -61,7 +61,7 @@ async function resolveRole(ctx) {
         return { role: 'rejected', reject_reason: 'db_error', chat_id: chatId };
     }
 
-    return { role: 'unknown', chat_id: chatId, username: msg.from?.username, display_name: msg.from?.first_name };
+    return { role: 'unknown', chat_id: chatId, username: ctx.from?.username, display_name: ctx.from?.first_name };
 }
 
 /**
@@ -82,11 +82,13 @@ async function roleMiddleware(ctx, next) {
         } else if (reason === 'bot_misconfig') {
             try { await ctx.reply('❌ Bot misconfigured. Contact admin.'); } catch (_) {}
         }
+        const auditCmd = ctx.message?.text?.split(' ')[0] || ctx.callbackQuery?.data || null;
+        const auditArgs = ctx.message?.text || ctx.callbackQuery?.data || null;
         await logAudit({
             chat_id: resolution.chat_id || 'unknown',
             role: 'unknown',
-            cmd: ctx.message?.text?.split(' ')[0] || null,
-            args: ctx.message?.text || null,
+            cmd: auditCmd,
+            args: auditArgs,
             result: 'rejected',
             error_message: reason
         });
@@ -105,14 +107,23 @@ function requireRole(allowedRoles) {
     return async (ctx, next) => {
         const r = ctx.state.role;
         if (!allowedRoles.includes(r.role)) {
-            const cmd = ctx.message?.text?.split(' ')[0] || 'unknown';
+            // F6 mini-scan Sprint 2b fix: audit cmd/args for callback_query too
+            const cmd = ctx.message?.text?.split(' ')[0] || ctx.callbackQuery?.data || 'unknown';
+            const args = ctx.message?.text || ctx.callbackQuery?.data || null;
             const { escapeHtml } = require('./util');
-            await ctx.reply(`❌ Insufficient permission.\nYou are: <b>${escapeHtml(r.role)}</b>\nRequired: <b>${escapeHtml(allowedRoles.join(' or '))}</b>`, { parse_mode: 'HTML' });
+            // answerCbQuery lebih tepat untuk callback — ctx.reply() creates new message
+            try {
+                if (ctx.callbackQuery) {
+                    await ctx.answerCbQuery('❌ Insufficient permission.', { show_alert: true });
+                } else {
+                    await ctx.reply(`❌ Insufficient permission.\nYou are: <b>${escapeHtml(r.role)}</b>\nRequired: <b>${escapeHtml(allowedRoles.join(' or '))}</b>`, { parse_mode: 'HTML' });
+                }
+            } catch (_) { /* best-effort */ }
             await logAudit({
                 chat_id: r.chat_id,
                 role: r.role,
                 cmd,
-                args: ctx.message?.text,
+                args,
                 result: 'denied',
                 error_message: `requires ${allowedRoles.join('|')}`
             });
