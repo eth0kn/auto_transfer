@@ -30,14 +30,16 @@ function registerHandlers(bot) {
     bot.action(/^del_ok:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteConfirm);
     bot.action(/^del_no:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteCancel);
 
-    // Sprint 2c: /edit wizard inline-button callbacks
-    bot.action(/^edit_field:(username|password|callback_url|api_key)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
+    // Sprint 2c + v4.3.6 hotfix: /edit wizard inline-button callbacks
+    // Field whitelist realigned to clientapp schema (dropped username + api_key).
+    bot.action(/^edit_field:(alias|password|callback_url|device_id|remote_ip)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
     bot.action(/^edit_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleEditConfirm);
     bot.action(/^edit_cancel$/, requireRole(['owner', 'operator']), op.handleEditCancelAction);
 
-    // Sprint 2d-1: /add wizard inline-button callbacks
-    // add_rdp:<hostname> — hostname pattern loose (any safe chars); backend re-validates scope.
-    bot.action(/^add_rdp:([A-Za-z0-9._\-]{1,55})$/, requireRole(['owner', 'operator']), op.handleAddRdpPick);
+    // Sprint 2d-1 + v4.3.6 hotfix: /add wizard inline-button callbacks
+    // add_rdp:<hostname> — accept any non-control char (spaces + case + special — Windows hostname
+    // naming is loose at clientapp registration; backend re-validates scope at click time.
+    bot.action(/^add_rdp:([^\x00-\x1F\x7F]{1,55})$/, requireRole(['owner', 'operator']), op.handleAddRdpPick);
     bot.action(/^add_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleAddConfirm);
     bot.action(/^add_cancel$/, requireRole(['owner', 'operator']), op.handleAddCancelAction);
 

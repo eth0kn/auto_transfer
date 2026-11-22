@@ -17,39 +17,44 @@ const { startWizard, getActiveWizard, advanceWizard, cancelWizard } = require('.
 const pendingDeletes = new Map();
 const PENDING_TTL_MS = 60 * 1000;
 
-// Sprint 2c: /edit field whitelist (mirror of backend telegram-bot-ipc.js)
+// Sprint 2c + v4.3.6 hotfix: /edit field whitelist aligned with clientapp DB schema.
+// Scanner report 2026-11-22: clientapp accounts table has NO username / api_key columns.
+// Login BRImo pakai password saja (alias cuma UI label). Field whitelist now:
+// alias | password | callback_url | device_id | remote_ip  (5 fields).
 const EDIT_FIELDS = [
-    { key: 'username',     label: 'Username' },
+    { key: 'alias',        label: 'Alias' },
     { key: 'password',     label: 'Password' },
     { key: 'callback_url', label: 'Callback URL' },
-    { key: 'api_key',      label: 'API Key' },
+    { key: 'device_id',    label: 'Device ID' },
+    { key: 'remote_ip',    label: 'Remote IP' },
 ];
-const SENSITIVE_EDIT_FIELDS = new Set(['password', 'api_key']);
+const SENSITIVE_EDIT_FIELDS = new Set(['password']);
 function maskForDisplay(field, value) {
     if (SENSITIVE_EDIT_FIELDS.has(field)) return '••••••••';
     if (typeof value !== 'string') return '-';
     return value.length > 60 ? value.slice(0, 57) + '...' : value;
 }
 
-// Sprint 2d-1: /add wizard field progression + validation
-// Each step collects one field in state_json.data, keyed below.
-// SENSITIVE_ADD_FIELDS are masked in confirm message + never in audit args.
+// Sprint 2d-1 + v4.3.6 hotfix: /add wizard — 3 required fields only, aligned with
+// clientapp schema (alias + password + callback_url). Optional fields (device_id,
+// remote_ip, keep_balance, mutasi_enabled, mirror_enabled) defer to future sprint
+// since they need number/toggle validation UI.
+// Alias constraint relaxed: unrestricted printable, ≤128 chars — matches UI field
+// `<input type="text" id="inp-alias">` which has no pattern/maxlength/required.
 const ADD_STEPS = [
-    { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (A-Z 0-9 _ - . only, ≤64 chars):' },
-    { key: 'username',     label: 'Username',     prompt: 'Send the <b>username</b> for BRImo login:' },
+    { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (free text, space allowed, ≤128 chars). Example: <code>Toko A 123</code>' },
     { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> for BRImo login.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
     { key: 'callback_url', label: 'Callback URL', prompt: 'Send the <b>callback URL</b> (http:// or https://):' },
-    { key: 'api_key',      label: 'API Key',      prompt: 'Send the <b>API key</b>.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
 ];
-const SENSITIVE_ADD_FIELDS = new Set(['password', 'api_key']);
-const ALIAS_REGEX = /^[A-Za-z0-9_\-.]+$/;
+const SENSITIVE_ADD_FIELDS = new Set(['password']);
+// Allow any printable char (space, digit, latin, Indonesian, special) — ban control chars only.
+const ALIAS_REGEX = /^[^\x00-\x1F\x7F]{1,128}$/;
 const URL_REGEX   = /^https?:\/\/.+/i;
 
 function validateAddField(key, value) {
     if (typeof value !== 'string' || !value.length) return { ok: false, error: 'empty' };
     if (value.length > 2048) return { ok: false, error: 'too_long' };
     if (key === 'alias') {
-        if (value.length > 64) return { ok: false, error: 'alias_too_long_64' };
         if (!ALIAS_REGEX.test(value)) return { ok: false, error: 'alias_bad_chars' };
     } else if (key === 'callback_url') {
         if (!URL_REGEX.test(value)) return { ok: false, error: 'url_bad_scheme' };
@@ -532,15 +537,15 @@ async function handleEditCancelAction(ctx) {
 }
 
 // ==========================================================
-// /add — Sprint 2d-1
-// Wizard flow: pick_rdp → ask_alias → ask_username → ask_password → ask_callback_url → ask_api_key → confirm → POST
+// /add — Sprint 2d-1 (v4.3.6 hotfix: field schema realigned with clientapp)
+// Wizard flow: pick_rdp → ask_alias → ask_password → ask_callback_url → confirm → POST
 // ==========================================================
 
 async function handleAdd(ctx) {
     const r = ctx.state.role;
     if (ctx.message?.text && ctx.message.text.trim().split(/\s+/).length > 1) {
         await ctx.reply(
-            'Usage: <code>/add</code> (no args — wizard asks each field in turn).\n\n<i>Fields: alias, username, password, callback_url, api_key.</i>',
+            'Usage: <code>/add</code> (no args — wizard asks each field in turn).\n\n<i>Fields: alias, password, callback_url.</i>',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/add', result: 'rejected', error_message: 'unexpected_args' });
@@ -652,10 +657,9 @@ async function handleAddValueInput(ctx, active) {
     if (!check.ok) {
         const msgs = {
             empty: 'Empty value.',
-            too_long: 'Too long.',
+            too_long: 'Too long (max 2048).',
             too_long_1024: 'Too long (max 1024).',
-            alias_too_long_64: 'Alias too long (max 64 chars).',
-            alias_bad_chars: 'Alias chars must be A-Z 0-9 _ - . only.',
+            alias_bad_chars: 'Alias must be 1-128 printable chars (no control chars).',
             url_bad_scheme: 'Callback URL must start with http:// or https://.'
         };
         await ctx.reply(`❌ ${msgs[check.error] || check.error}\n\nSend the value again or /cancel.`, { parse_mode: 'HTML' });
@@ -688,10 +692,8 @@ async function handleAddValueInput(ctx, active) {
         ``,
         `RDP: <code>${escapeHtml(merged.rdp_hostname)}</code>`,
         `Alias: <code>${escapeHtml(merged.alias)}</code>`,
-        `Username: <code>${escapeHtml(merged.username)}</code>`,
         `Password: <code>${escapeHtml(maskAddForDisplay('password', merged.password))}</code>`,
         `Callback URL: <code>${escapeHtml(maskAddForDisplay('callback_url', merged.callback_url))}</code>`,
-        `API Key: <code>${escapeHtml(maskAddForDisplay('api_key', merged.api_key))}</code>`,
         ``,
         `<i>Account will be created on the target RDP.</i>`
     ];
@@ -734,9 +736,9 @@ async function handleAddConfirm(ctx) {
         return;
     }
 
-    const { alias, rdp_hostname, username, password, callback_url, api_key } = active.data;
+    const { alias, rdp_hostname, password, callback_url } = active.data;
     const resp = await postJson('/account/add', {
-        alias, rdp_hostname, username, password, callback_url, api_key,
+        alias, rdp_hostname, password, callback_url,
         operator_chat_id: r.chat_id
     });
 
@@ -770,7 +772,7 @@ async function handleAddConfirm(ctx) {
         chat_id: r.chat_id,
         role: r.role,
         cmd: '/add:confirm',
-        args: `${alias}@${rdp_hostname} user=${username.slice(0, 40)}`,
+        args: `${alias}@${rdp_hostname} cb=${callback_url.slice(0, 60)}`,
         result: auditResult,
         error_message: auditErrMsg
     });

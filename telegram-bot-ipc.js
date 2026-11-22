@@ -103,10 +103,15 @@ router.get('/health', (req, res) => {
 
 // ==========================================================
 // Field whitelist for /edit — gate what's editable from bot
-// Sensitive fields (password, api_key) have their VALUE masked in audit.
+// v4.3.6 hotfix (scanner 2026-11-22): aligned with clientapp accounts table.
+// NO username / api_key columns exist. Login BRImo pakai password saja.
+// Editable: alias | password | callback_url | device_id | remote_ip (5 fields).
+// Deferred (need toggle/number validation): keep_balance, mutasi_enabled, mirror_enabled.
 // ==========================================================
-const EDITABLE_FIELDS = new Set(['username', 'password', 'callback_url', 'api_key']);
-const SENSITIVE_FIELDS = new Set(['password', 'api_key']);
+const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'remote_ip']);
+const SENSITIVE_FIELDS = new Set(['password']);
+const ALIAS_REGEX = /^[^\x00-\x1F\x7F]{1,128}$/;
+const URL_REGEX   = /^https?:\/\/.+/i;
 
 function maskedArgs(alias, rdp, field, value) {
     const v = SENSITIVE_FIELDS.has(field) ? '***' : (typeof value === 'string' ? value.slice(0, 40) : '?');
@@ -162,32 +167,29 @@ router.post('/account/delete', async (req, res) => {
 });
 
 // POST /api/tg/account/add
-// Body: { alias, rdp_hostname, username, password, callback_url, api_key, operator_chat_id }
-// Response Sprint 2d-1: 501 — clientapp support coming Sprint 2e
+// Body: { alias, rdp_hostname, password, callback_url, operator_chat_id }
+// v4.3.6 hotfix: username + api_key dropped — not in clientapp schema.
+// Response Sprint 2d-1: 501 — clientapp support coming Sprint 2e.
 router.post('/account/add', async (req, res) => {
-    const { alias, rdp_hostname, username, password, callback_url, api_key, operator_chat_id } = req.body || {};
+    const { alias, rdp_hostname, password, callback_url, operator_chat_id } = req.body || {};
     const missing = [];
     if (!alias) missing.push('alias');
     if (!rdp_hostname) missing.push('rdp_hostname');
-    if (!username) missing.push('username');
     if (!password) missing.push('password');
     if (!callback_url) missing.push('callback_url');
-    if (!api_key) missing.push('api_key');
     if (!operator_chat_id) missing.push('operator_chat_id');
     if (missing.length) {
         return res.status(400).json({ error: 'missing_fields', detail: `required: ${missing.join(', ')}` });
     }
 
     // Length + format guards (defense in depth against bot-side slip-through)
-    if (typeof alias !== 'string' || alias.length > 64 || !/^[A-Za-z0-9_\-.]+$/.test(alias)) {
-        return res.status(400).json({ error: 'invalid_alias', detail: 'A-Z 0-9 _ - . only, ≤64 chars' });
+    if (typeof alias !== 'string' || !ALIAS_REGEX.test(alias)) {
+        return res.status(400).json({ error: 'invalid_alias', detail: 'printable chars only, 1-128 length' });
     }
-    for (const [k, v] of [['username', username], ['password', password], ['api_key', api_key]]) {
-        if (typeof v !== 'string' || !v.length || v.length > 1024) {
-            return res.status(400).json({ error: `invalid_${k}`, detail: `${k} must be non-empty string ≤1024 chars` });
-        }
+    if (typeof password !== 'string' || !password.length || password.length > 1024) {
+        return res.status(400).json({ error: 'invalid_password', detail: 'password must be non-empty string ≤1024 chars' });
     }
-    if (typeof callback_url !== 'string' || !/^https?:\/\/.+/i.test(callback_url) || callback_url.length > 2048) {
+    if (typeof callback_url !== 'string' || !URL_REGEX.test(callback_url) || callback_url.length > 2048) {
         return res.status(400).json({ error: 'invalid_callback_url', detail: 'must be http(s)://... ≤2048 chars' });
     }
 
@@ -204,12 +206,12 @@ router.post('/account/add', async (req, res) => {
         return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
     }
 
-    // Audit the add request (password + api_key values NEVER go in args — masked).
+    // Audit the add request (password value NEVER in args — only alias + callback).
     try {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} user=${username.slice(0, 40)} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d1_scaffold_queued']
+            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d1_scaffold_queued']
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
@@ -218,7 +220,7 @@ router.post('/account/add', async (req, res) => {
     return res.status(501).json({
         status: 'not_implemented_yet',
         detail: 'Backend auth + scope + field validation OK. Clientapp support coming Sprint 2e.',
-        received: { alias, rdp_hostname, username, callback_url, operator_chat_id },
+        received: { alias, rdp_hostname, callback_url, operator_chat_id },
         scope: scopeCheck
     });
 });
@@ -247,9 +249,16 @@ router.post('/account/edit', async (req, res) => {
         return res.status(400).json({ error: 'field_not_editable', detail: `allowed: ${[...EDITABLE_FIELDS].join('|')}` });
     }
 
-    // Length guard — value capped at 1024 chars (defense in depth)
-    if (typeof value !== 'string' || value.length > 1024) {
-        return res.status(400).json({ error: 'invalid_value', detail: 'value must be string ≤1024 chars' });
+    // Per-field validation (defense in depth — mirrors /add constraints).
+    if (typeof value !== 'string' || !value.length) {
+        return res.status(400).json({ error: 'invalid_value', detail: 'value must be non-empty string' });
+    }
+    if (field === 'alias') {
+        if (!ALIAS_REGEX.test(value)) return res.status(400).json({ error: 'invalid_alias', detail: 'printable chars only, 1-128 length' });
+    } else if (field === 'callback_url') {
+        if (!URL_REGEX.test(value) || value.length > 2048) return res.status(400).json({ error: 'invalid_callback_url', detail: 'must be http(s)://... ≤2048 chars' });
+    } else if (value.length > 1024) {
+        return res.status(400).json({ error: 'invalid_value', detail: 'value must be ≤1024 chars' });
     }
 
     // Validate scope (same logic as /delete)
