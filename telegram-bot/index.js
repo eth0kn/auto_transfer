@@ -51,17 +51,18 @@ registerHandlers(bot);
 // omitted from this public list to avoid info disclosure to unknown users
 // who stumble on the bot.
 const BOT_COMMANDS = [
-    { command: 'start',     description: 'Greeting + role check' },
-    { command: 'whoami',    description: 'Show my chat_id + role' },
-    { command: 'help',      description: 'Show help text' },
-    { command: 'list',      description: 'List approved RDPs in my scope' },
-    { command: 'status',    description: 'System status summary' },
-    { command: 'add',       description: 'Add new account (wizard: alias, password, callback, Saldo Minimal, ADB pair)' },
-    { command: 'edit',      description: 'Edit account field — /edit <alias> [rdp_hostname]' },
-    { command: 'delete',    description: 'Delete account — /delete <alias> [rdp_hostname]' },
-    { command: 'start_bot', description: 'Start bot engine — /start_bot <alias> [rdp_hostname]' },
-    { command: 'stop_bot',  description: 'Stop bot engine — /stop_bot <alias> [rdp_hostname]' },
-    { command: 'cancel',    description: 'Cancel active wizard' },
+    { command: 'start',         description: 'Greeting + role check' },
+    { command: 'whoami',        description: 'Show my chat_id + role' },
+    { command: 'help',          description: 'Show help text' },
+    { command: 'list',          description: 'List approved RDPs in my scope' },
+    { command: 'list_accounts', description: 'List all accounts across my scope (grouped per RDP + bot state)' },
+    { command: 'status',        description: 'System status summary' },
+    { command: 'add',           description: 'Add new account (wizard: alias, password, callback, Saldo Minimal, ADB pair)' },
+    { command: 'edit',          description: 'Edit account field — /edit <alias> [rdp_hostname]' },
+    { command: 'delete',        description: 'Delete account — /delete <alias> [rdp_hostname]' },
+    { command: 'start_bot',     description: 'Start bot engine — /start_bot <alias> [rdp_hostname]' },
+    { command: 'stop_bot',      description: 'Stop bot engine — /stop_bot <alias> [rdp_hostname]' },
+    { command: 'cancel',        description: 'Cancel active wizard' },
 ];
 
 // Global error handler

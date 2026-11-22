@@ -1337,11 +1337,144 @@ async function handlePickRdp(ctx) {
     }
 }
 
+// ==========================================================
+// /list_accounts — Sprint 3 polish (v4.3.14)
+// Fan-out ke semua RDP di operator scope, aggregate per RDP, kirim HTML
+// dengan chunked message split kalau total render > ~3500 chars (Telegram
+// per-message cap 4096, buffer 500 untuk safety + header/footer append).
+// ==========================================================
+
+const LIST_MSG_CAP = 3500;
+const LIST_MAX_MESSAGES = 10;
+
+function formatRupiah(n) {
+    const v = parseInt(n, 10);
+    if (!Number.isInteger(v)) return 'Rp 0';
+    return 'Rp ' + v.toLocaleString('id-ID');
+}
+
+function renderAccountLine(acc) {
+    const stateEmoji = acc.bot_state === 'running' ? '✅' : '⏸️';
+    const device = acc.device_id || '-';
+    const keep = formatRupiah(acc.keep_balance);
+    const flags = [];
+    if (acc.mutasi_enabled) flags.push('🔄 Mutasi');
+    if (acc.mirror_enabled) flags.push('📺 Mirror');
+    const flagsStr = flags.length ? flags.join(' • ') : '—';
+    const remoteIpLine = acc.remote_ip ? `\n     Remote IP: <code>${escapeHtml(acc.remote_ip)}</code>` : '';
+    return [
+        `  ${stateEmoji} <b>${escapeHtml(acc.alias)}</b>`,
+        `     Device: <code>${escapeHtml(device)}</code>${remoteIpLine}`,
+        `     Saldo min: ${escapeHtml(keep)} • ${flagsStr}`,
+    ].join('\n');
+}
+
+function renderRdpHeader(group) {
+    if (group.status === 'ok') {
+        return `🖥️ <b>${escapeHtml(group.rdp_hostname)}</b> • ${group.accounts.length} account(s)`;
+    }
+    if (group.status === 'offline') {
+        return `🖥️ <b>${escapeHtml(group.rdp_hostname)}</b> • ⚠️ Unreachable (${escapeHtml(group.detail || 'offline')})`;
+    }
+    return `🖥️ <b>${escapeHtml(group.rdp_hostname)}</b> • ❌ Error (${escapeHtml(group.detail || 'unknown')})`;
+}
+
+async function handleListAccounts(ctx) {
+    const r = ctx.state.role;
+    const typingMsg = await ctx.reply('🔍 Scanning RDPs...', { parse_mode: 'HTML' });
+
+    const resp = await getJson(`/accounts/list?operator_chat_id=${encodeURIComponent(r.chat_id)}`);
+    if (!resp.ok) {
+        const replyText = `❌ List failed: ${escapeHtml(resp.data?.detail || `status ${resp.status}`)}`;
+        try { await ctx.telegram.editMessageText(typingMsg.chat.id, typingMsg.message_id, undefined, replyText, { parse_mode: 'HTML' }); }
+        catch (_) { await ctx.reply(replyText, { parse_mode: 'HTML' }); }
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list_accounts', result: 'error', error_message: resp.data?.error || `http_${resp.status}` });
+        return;
+    }
+
+    const { groups, totals } = resp.data;
+    if (!Array.isArray(groups) || groups.length === 0) {
+        const replyText = `📋 No RDPs in your scope. Contact owner.`;
+        try { await ctx.telegram.editMessageText(typingMsg.chat.id, typingMsg.message_id, undefined, replyText, { parse_mode: 'HTML' }); }
+        catch (_) { await ctx.reply(replyText, { parse_mode: 'HTML' }); }
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list_accounts', result: 'rejected', error_message: 'no_rdps_in_scope' });
+        return;
+    }
+
+    // Build messages — per-account line iteration (mini-scan G1 fix: single
+    // large RDP group was treated as atomic blob → could exceed 4096 Telegram
+    // cap). Now flush per-line when buf would overflow; continuation header
+    // ("(cont.)") inserted so operator sees RDP context preserved across split.
+    const header = `📋 <b>Accounts Overview</b>`;
+    const footer = `📊 ${totals.scanned} RDP scanned, ${totals.responded} responded. ${totals.accounts} account(s): ${totals.running} running, ${totals.stopped} stopped.`;
+    const messages = [];
+    let buf = header;
+    let truncated = false;
+    outer:
+    for (const group of groups) {
+        const groupHeader = renderRdpHeader(group);
+        // Flush before header if buf + header overflows
+        const headerAppend = (buf ? '\n\n' : '') + groupHeader;
+        if ((buf + headerAppend).length > LIST_MSG_CAP) {
+            messages.push(buf);
+            if (messages.length >= LIST_MAX_MESSAGES - 1) { truncated = true; break; }
+            buf = groupHeader;
+        } else {
+            buf += headerAppend;
+        }
+        // Iterate per-account line
+        for (const acc of group.accounts) {
+            const lineAppend = '\n' + renderAccountLine(acc);
+            if ((buf + lineAppend).length > LIST_MSG_CAP) {
+                messages.push(buf);
+                if (messages.length >= LIST_MAX_MESSAGES - 1) { truncated = true; break outer; }
+                buf = `${groupHeader} <i>(cont.)</i>` + lineAppend;
+            } else {
+                buf += lineAppend;
+            }
+        }
+    }
+    if (truncated) buf += '\n\n<i>... (truncated — too many RDPs/accounts)</i>';
+    // Append footer to last buffer kalau muat, else push as separate message
+    if ((buf + '\n\n' + footer).length <= LIST_MSG_CAP) {
+        buf += '\n\n' + footer;
+        messages.push(buf);
+    } else {
+        messages.push(buf);
+        messages.push(footer);
+    }
+
+    // Send first message as edit of typingMsg (replaces "Scanning..."), rest as new replies
+    try { await ctx.telegram.editMessageText(typingMsg.chat.id, typingMsg.message_id, undefined, messages[0], { parse_mode: 'HTML' }); }
+    catch (_) { await ctx.reply(messages[0], { parse_mode: 'HTML' }); }
+    for (let i = 1; i < messages.length; i++) {
+        try { await ctx.reply(messages[i], { parse_mode: 'HTML' }); }
+        catch (e) { console.error('[/list_accounts] send msg', i, 'failed:', e.message); }
+    }
+
+    await logAudit({
+        chat_id: r.chat_id, role: r.role, cmd: '/list_accounts',
+        args: `scanned=${totals.scanned} responded=${totals.responded} accounts=${totals.accounts}`,
+        result: 'success'
+    });
+
+    if (r.role === 'operator') {
+        await forwardToOwner({
+            ctx,
+            operatorChatId: r.chat_id,
+            operatorLabel: r.operator?.display_name || 'operator',
+            cmd: '/list_accounts',
+            result: `${totals.accounts} accounts across ${totals.responded}/${totals.scanned} RDPs`
+        });
+    }
+}
+
 module.exports = {
     handleList, handleStatus,
     handleDelete, handleDeleteConfirm, handleDeleteCancel,
     handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction,
     handleEditDevicePick, handleEditDeviceManual,
     handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction,
-    handleStart, handleStop, handlePickRdp
+    handleStart, handleStop, handlePickRdp,
+    handleListAccounts
 };

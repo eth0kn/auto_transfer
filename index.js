@@ -1597,6 +1597,12 @@ function setupBotNamespace(app_source) {
             catch (e) { console.error('[tg-ctrl] bot_control_ack resolveAck threw:', e.message); }
         });
 
+        // Sprint 3 polish (v4.3.14): ack dispatch for /list_accounts fan-out.
+        socket.on('tg:list_accounts_ack', (payload) => {
+            try { tgIpc.resolveAck(payload); }
+            catch (e) { console.error('[tg-ctrl] list_accounts_ack resolveAck threw:', e.message); }
+        });
+
         socket.on('disconnect', async (reason) => {
             // Sprint 2e (v4.3.8): control-plane socket cleanup. Runs first — control sockets
             // don't have bot_id so the bot cleanup path below short-circuits for them.

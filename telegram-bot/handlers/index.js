@@ -27,6 +27,8 @@ function registerHandlers(bot) {
     // Sprint 3 (v4.3.10): runtime bot control + alias-only args retrofit
     bot.command('start_bot', requireRole(['owner', 'operator']), op.handleStart);
     bot.command('stop_bot',  requireRole(['owner', 'operator']), op.handleStop);
+    // Sprint 3 polish (v4.3.14): aggregated accounts view across operator scope
+    bot.command('list_accounts', requireRole(['owner', 'operator']), op.handleListAccounts);
 
     // Sprint 2b: inline-button callbacks for /delete confirm flow
     // Pattern: del_ok:<cbid> and del_no:<cbid>, cbid = 12 hex chars

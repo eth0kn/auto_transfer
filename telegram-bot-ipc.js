@@ -100,6 +100,62 @@ async function fanoutAliasLookup(alias, operatorChatId, opts = {}) {
 }
 
 /**
+ * Sprint 3 polish (v4.3.14): fan-out `tg:list_accounts` to all RDPs in operator
+ * scope. Per-RDP 5s timeout, parallel. Returns:
+ *   { groups: [{rdp_hostname, status: 'ok'|'offline'|'error', accounts: []}], totals: {scanned, responded, accounts, running, stopped} }
+ * `status`:
+ *   - 'ok' — clientapp responded with accounts array
+ *   - 'offline' — no control socket OR timeout (treated identically for display)
+ *   - 'error' — other failure (db_error at clientapp side etc)
+ * Each account row (non-sensitive): { account_id, alias, device_id, remote_ip,
+ *   keep_balance, mutasi_enabled, mirror_enabled, bot_state }
+ */
+async function fanoutListAccounts(operatorChatId, opts = {}) {
+    const rdpList = await getOperatorScopeRdps(operatorChatId);
+    const groups = [];
+    let totalAccounts = 0, totalRunning = 0, totalStopped = 0, responded = 0;
+    if (rdpList.length === 0) return { groups, totals: { scanned: 0, responded: 0, accounts: 0, running: 0, stopped: 0 } };
+    const timeout_ms = opts.timeout_ms || 5000;
+    const settled = await Promise.allSettled(
+        rdpList.map(rdp => callClientapp(rdp, 'tg:list_accounts', {}, { timeout_ms }))
+    );
+    for (let i = 0; i < settled.length; i++) {
+        const rdp = rdpList[i];
+        const s = settled[i];
+        if (s.status !== 'fulfilled') {
+            groups.push({ rdp_hostname: rdp, status: 'error', accounts: [], detail: 'promise_rejected' });
+            continue;
+        }
+        const r = s.value;
+        if (!r.ok) {
+            const mapped = (r.error === 'rdp_offline' || r.error === 'rdp_timeout') ? 'offline' : 'error';
+            groups.push({ rdp_hostname: rdp, status: mapped, accounts: [], detail: r.detail || r.error });
+            continue;
+        }
+        responded++;
+        const accounts = Array.isArray(r.result?.accounts) ? r.result.accounts : [];
+        totalAccounts += accounts.length;
+        for (const a of accounts) {
+            if (a.bot_state === 'running') totalRunning++;
+            else totalStopped++;
+        }
+        // Sort accounts within RDP by alias (alphabetical) for consistent output
+        accounts.sort((a, b) => String(a.alias).localeCompare(String(b.alias)));
+        groups.push({ rdp_hostname: rdp, status: 'ok', accounts });
+    }
+    return {
+        groups,
+        totals: {
+            scanned: rdpList.length,
+            responded,
+            accounts: totalAccounts,
+            running: totalRunning,
+            stopped: totalStopped
+        }
+    };
+}
+
+/**
  * Send event to the target RDP's control socket, await ack with timeout.
  * Returns: { ok: true, result } on success, { ok: false, error, detail, status } on failure.
  * app_source defaults to 'brimo' for Sprint 2e scope — Sprint 2f expands to mybca/seabank.
@@ -601,6 +657,19 @@ router.get('/account/devices', async (req, res) => {
     if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
     const devices = Array.isArray(rt.result?.devices) ? rt.result.devices : [];
     return res.json({ ok: true, devices });
+});
+
+// GET /api/tg/accounts/list?operator_chat_id=X
+// Sprint 3 polish (v4.3.14): fan-out list of all accounts across operator's
+// scope. Returns groups-by-RDP structure + totals summary.
+// Each account row: non-sensitive metadata only (NO password, NO callback_url).
+router.get('/accounts/list', async (req, res) => {
+    const operator_chat_id = req.query?.operator_chat_id;
+    if (!operator_chat_id) {
+        return res.status(400).json({ error: 'missing_fields', detail: 'required: operator_chat_id' });
+    }
+    const result = await fanoutListAccounts(operator_chat_id);
+    return res.json({ ok: true, ...result });
 });
 
 module.exports = { router, setDb, setEmitter, resolveAck };
