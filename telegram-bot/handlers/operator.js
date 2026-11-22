@@ -35,21 +35,38 @@ function maskForDisplay(field, value) {
     return value.length > 60 ? value.slice(0, 57) + '...' : value;
 }
 
-// Sprint 2d-1 + v4.3.6 hotfix: /add wizard — 3 required fields only, aligned with
-// clientapp schema (alias + password + callback_url). Optional fields (device_id,
-// remote_ip, keep_balance, mutasi_enabled, mirror_enabled) defer to future sprint
-// since they need number/toggle validation UI.
-// Alias constraint relaxed: unrestricted printable, ≤128 chars — matches UI field
-// `<input type="text" id="inp-alias">` which has no pattern/maxlength/required.
+// Sprint 2d-1 + v4.3.6 hotfix: /add wizard — 3 banking fields aligned with
+// clientapp schema (alias + password + callback_url). Optional bank fields
+// (device_id, remote_ip, keep_balance, mutasi_enabled, mirror_enabled) defer.
+// Alias constraint relaxed: unrestricted printable, ≤128 chars.
+//
+// Sprint 2d-2 (v4.3.7): add ADB pair step per Q2=C locked. 2 extra wizard steps
+// after callback_url collect `device_ip` (IP:PAIR_PORT shown on HP wireless
+// debugging dialog) + `pair_code` (6-digit shown with it). Backend sends
+// `adb pair <ip> <code>` to RDP via socket at Sprint 2e; scaffold returns 501.
 const ADD_STEPS = [
     { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (free text, space allowed, ≤128 chars). Example: <code>Toko A 123</code>' },
     { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> for BRImo login.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
     { key: 'callback_url', label: 'Callback URL', prompt: 'Send the <b>callback URL</b> (http:// or https://):' },
+    { key: 'device_ip',    label: 'Device IP',    prompt: 'Send the <b>pair IP:port</b> shown on HP → Settings → Developer → Wireless debugging → <i>Pair device with pairing code</i>.\n\nFormat: <code>IP:PORT</code> (example <code>100.64.0.11:40123</code>). Port changes each time — use the pairing port, not the regular ADB port.' },
+    { key: 'pair_code',    label: 'Pair code',    prompt: 'Send the <b>6-digit pair code</b> shown on HP alongside the IP above.\n\n<i>⚠️ Time-sensitive — expires when the HP\'s pairing dialog closes.</i>' },
 ];
-const SENSITIVE_ADD_FIELDS = new Set(['password']);
+const SENSITIVE_ADD_FIELDS = new Set(['password', 'pair_code']);
 // Allow any printable char (space, digit, latin, Indonesian, special) — ban control chars only.
-const ALIAS_REGEX = /^[^\x00-\x1F\x7F]{1,128}$/;
-const URL_REGEX   = /^https?:\/\/.+/i;
+const ALIAS_REGEX     = /^[^\x00-\x1F\x7F]{1,128}$/;
+const URL_REGEX       = /^https?:\/\/.+/i;
+const DEVICE_IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
+const PAIR_CODE_REGEX = /^\d{6}$/;
+
+function validateDeviceIp(value) {
+    if (!DEVICE_IP_REGEX.test(value)) return false;
+    const [ipPart, portPart] = value.split(':');
+    const octets = ipPart.split('.').map(n => parseInt(n, 10));
+    if (octets.some(o => o < 0 || o > 255 || Number.isNaN(o))) return false;
+    const port = parseInt(portPart, 10);
+    if (Number.isNaN(port) || port < 1 || port > 65535) return false;
+    return true;
+}
 
 function validateAddField(key, value) {
     if (typeof value !== 'string' || !value.length) return { ok: false, error: 'empty' };
@@ -58,6 +75,10 @@ function validateAddField(key, value) {
         if (!ALIAS_REGEX.test(value)) return { ok: false, error: 'alias_bad_chars' };
     } else if (key === 'callback_url') {
         if (!URL_REGEX.test(value)) return { ok: false, error: 'url_bad_scheme' };
+    } else if (key === 'device_ip') {
+        if (!validateDeviceIp(value)) return { ok: false, error: 'device_ip_bad_format' };
+    } else if (key === 'pair_code') {
+        if (!PAIR_CODE_REGEX.test(value)) return { ok: false, error: 'pair_code_bad_format' };
     } else if (value.length > 1024) {
         return { ok: false, error: 'too_long_1024' };
     }
@@ -660,7 +681,9 @@ async function handleAddValueInput(ctx, active) {
             too_long: 'Too long (max 2048).',
             too_long_1024: 'Too long (max 1024).',
             alias_bad_chars: 'Alias must be 1-128 printable chars (no control chars).',
-            url_bad_scheme: 'Callback URL must start with http:// or https://.'
+            url_bad_scheme: 'Callback URL must start with http:// or https://.',
+            device_ip_bad_format: 'Device IP must be IP:PORT (e.g. 100.64.0.11:40123). Port 1-65535, octets 0-255.',
+            pair_code_bad_format: 'Pair code must be exactly 6 digits.'
         };
         await ctx.reply(`❌ ${msgs[check.error] || check.error}\n\nSend the value again or /cancel.`, { parse_mode: 'HTML' });
         return true;
@@ -694,8 +717,10 @@ async function handleAddValueInput(ctx, active) {
         `Alias: <code>${escapeHtml(merged.alias)}</code>`,
         `Password: <code>${escapeHtml(maskAddForDisplay('password', merged.password))}</code>`,
         `Callback URL: <code>${escapeHtml(maskAddForDisplay('callback_url', merged.callback_url))}</code>`,
+        `Device IP: <code>${escapeHtml(merged.device_ip)}</code>`,
+        `Pair code: <code>${escapeHtml(maskAddForDisplay('pair_code', merged.pair_code))}</code>`,
         ``,
-        `<i>Account will be created on the target RDP.</i>`
+        `<i>Account will be created on the target RDP + <code>adb pair</code> will run with the code above.</i>`
     ];
     await ctx.reply(lines.join('\n'), {
         parse_mode: 'HTML',
@@ -736,9 +761,9 @@ async function handleAddConfirm(ctx) {
         return;
     }
 
-    const { alias, rdp_hostname, password, callback_url } = active.data;
+    const { alias, rdp_hostname, password, callback_url, device_ip, pair_code } = active.data;
     const resp = await postJson('/account/add', {
-        alias, rdp_hostname, password, callback_url,
+        alias, rdp_hostname, password, callback_url, device_ip, pair_code,
         operator_chat_id: r.chat_id
     });
 
@@ -772,7 +797,7 @@ async function handleAddConfirm(ctx) {
         chat_id: r.chat_id,
         role: r.role,
         cmd: '/add:confirm',
-        args: `${alias}@${rdp_hostname} cb=${callback_url.slice(0, 60)}`,
+        args: `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`,
         result: auditResult,
         error_message: auditErrMsg
     });

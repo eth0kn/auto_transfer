@@ -91,12 +91,12 @@ async function handleHelp(ctx) {
             `• <code>/audit [chat_id] [limit]</code> — view audit log`,
             ``,
             `<b>Account CRUD</b>`,
-            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url)`,
+            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url → device IP → pair code)`,
             `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit field via wizard (alias/password/callback_url/device_id/remote_ip)`,
             `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline Y/N confirm)`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): ADB pair step in /add (2d-2), /start_bot /stop_bot</i>`
+            `<i>Sprint 2+ (coming): /start_bot /stop_bot</i>`
         ].join('\n');
     } else if (r.role === 'operator') {
         text = [
@@ -105,12 +105,12 @@ async function handleHelp(ctx) {
             `• <code>/whoami</code> — your role info`,
             `• <code>/list</code> — list your accessible accounts (coming Sprint 2)`,
             `• <code>/status</code> — RDP + bot health (coming Sprint 2)`,
-            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url)`,
+            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url → device IP → pair code)`,
             `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit account field via wizard`,
             `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline confirm)`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): ADB pair step in /add (2d-2), /start_bot /stop_bot</i>`,
+            `<i>Sprint 2+ (coming): /start_bot /stop_bot</i>`,
             `<i>Contact owner if you need more access.</i>`
         ].join('\n');
     } else {

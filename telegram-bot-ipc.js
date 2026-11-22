@@ -110,8 +110,19 @@ router.get('/health', (req, res) => {
 // ==========================================================
 const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'remote_ip']);
 const SENSITIVE_FIELDS = new Set(['password']);
-const ALIAS_REGEX = /^[^\x00-\x1F\x7F]{1,128}$/;
-const URL_REGEX   = /^https?:\/\/.+/i;
+const ALIAS_REGEX     = /^[^\x00-\x1F\x7F]{1,128}$/;
+const URL_REGEX       = /^https?:\/\/.+/i;
+// Sprint 2d-2 (v4.3.7): ADB pair fields for /add.
+const DEVICE_IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
+const PAIR_CODE_REGEX = /^\d{6}$/;
+function isValidDeviceIp(v) {
+    if (typeof v !== 'string' || !DEVICE_IP_REGEX.test(v)) return false;
+    const [ipPart, portPart] = v.split(':');
+    const octets = ipPart.split('.').map(n => parseInt(n, 10));
+    if (octets.some(o => o < 0 || o > 255 || Number.isNaN(o))) return false;
+    const port = parseInt(portPart, 10);
+    return !Number.isNaN(port) && port >= 1 && port <= 65535;
+}
 
 function maskedArgs(alias, rdp, field, value) {
     const v = SENSITIVE_FIELDS.has(field) ? '***' : (typeof value === 'string' ? value.slice(0, 40) : '?');
@@ -167,16 +178,19 @@ router.post('/account/delete', async (req, res) => {
 });
 
 // POST /api/tg/account/add
-// Body: { alias, rdp_hostname, password, callback_url, operator_chat_id }
+// Body: { alias, rdp_hostname, password, callback_url, device_ip, pair_code, operator_chat_id }
 // v4.3.6 hotfix: username + api_key dropped — not in clientapp schema.
-// Response Sprint 2d-1: 501 — clientapp support coming Sprint 2e.
+// v4.3.7 (Sprint 2d-2): device_ip + pair_code added per Q2=C ADB pair step.
+// Response: 501 — clientapp support (DB insert + `adb pair` relay) coming Sprint 2e.
 router.post('/account/add', async (req, res) => {
-    const { alias, rdp_hostname, password, callback_url, operator_chat_id } = req.body || {};
+    const { alias, rdp_hostname, password, callback_url, device_ip, pair_code, operator_chat_id } = req.body || {};
     const missing = [];
     if (!alias) missing.push('alias');
     if (!rdp_hostname) missing.push('rdp_hostname');
     if (!password) missing.push('password');
     if (!callback_url) missing.push('callback_url');
+    if (!device_ip) missing.push('device_ip');
+    if (!pair_code) missing.push('pair_code');
     if (!operator_chat_id) missing.push('operator_chat_id');
     if (missing.length) {
         return res.status(400).json({ error: 'missing_fields', detail: `required: ${missing.join(', ')}` });
@@ -192,6 +206,12 @@ router.post('/account/add', async (req, res) => {
     if (typeof callback_url !== 'string' || !URL_REGEX.test(callback_url) || callback_url.length > 2048) {
         return res.status(400).json({ error: 'invalid_callback_url', detail: 'must be http(s)://... ≤2048 chars' });
     }
+    if (!isValidDeviceIp(device_ip)) {
+        return res.status(400).json({ error: 'invalid_device_ip', detail: 'IP:PORT (e.g. 100.64.0.11:40123), octets 0-255, port 1-65535' });
+    }
+    if (typeof pair_code !== 'string' || !PAIR_CODE_REGEX.test(pair_code)) {
+        return res.status(400).json({ error: 'invalid_pair_code', detail: 'exactly 6 digits' });
+    }
 
     // Validate scope
     const scopeCheck = await validateOperatorScope(operator_chat_id, rdp_hostname);
@@ -206,12 +226,13 @@ router.post('/account/add', async (req, res) => {
         return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
     }
 
-    // Audit the add request (password value NEVER in args — only alias + callback).
+    // Audit the add request. password + pair_code values NEVER in args (sensitive).
+    // device_ip IS logged — it's a routing identifier, not a secret.
     try {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d1_scaffold_queued']
+            [String(operator_chat_id), scopeCheck.role, '/add', `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`, 'success', 'sprint2d2_scaffold_queued']
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
@@ -219,8 +240,8 @@ router.post('/account/add', async (req, res) => {
 
     return res.status(501).json({
         status: 'not_implemented_yet',
-        detail: 'Backend auth + scope + field validation OK. Clientapp support coming Sprint 2e.',
-        received: { alias, rdp_hostname, callback_url, operator_chat_id },
+        detail: 'Backend auth + scope + field validation OK. Clientapp support (adb pair relay + DB insert) coming Sprint 2e.',
+        received: { alias, rdp_hostname, callback_url, device_ip, operator_chat_id },
         scope: scopeCheck
     });
 });
