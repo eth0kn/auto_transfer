@@ -1356,16 +1356,18 @@ function formatRupiah(n) {
 function renderAccountLine(acc) {
     const stateEmoji = acc.bot_state === 'running' ? '✅' : '⏸️';
     const device = acc.device_id || '-';
-    const keep = formatRupiah(acc.keep_balance);
     const flags = [];
     if (acc.mutasi_enabled) flags.push('🔄 Mutasi');
     if (acc.mirror_enabled) flags.push('📺 Mirror');
     const flagsStr = flags.length ? flags.join(' • ') : '—';
     const remoteIpLine = acc.remote_ip ? `\n     Remote IP: <code>${escapeHtml(acc.remote_ip)}</code>` : '';
+    // Sprint 3 polish (v4.3.15): saldo minimal removed from aggregated view
+    // per user request. Operator access via /edit <alias> → pick "Saldo Minimal"
+    // field tetap tampil current value.
     return [
         `  ${stateEmoji} <b>${escapeHtml(acc.alias)}</b>`,
         `     Device: <code>${escapeHtml(device)}</code>${remoteIpLine}`,
-        `     Saldo min: ${escapeHtml(keep)} • ${flagsStr}`,
+        `     Flags: ${flagsStr}`,
     ].join('\n');
 }
 
