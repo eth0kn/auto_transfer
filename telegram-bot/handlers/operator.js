@@ -8,7 +8,7 @@ const { pool } = require('../db');
 const { logAudit } = require('../audit');
 const { forwardToOwner } = require('../shadow');
 const { escapeHtml } = require('../util');
-const { postJson } = require('../backend-client');
+const { postJson, getJson } = require('../backend-client');
 const { startWizard, getActiveWizard, advanceWizard, cancelWizard } = require('../wizard');
 
 // Short-lived pending-delete confirmations (callback_data cap 64 bytes)
@@ -19,14 +19,17 @@ const PENDING_TTL_MS = 60 * 1000;
 
 // Sprint 2c + v4.3.6 hotfix: /edit field whitelist aligned with clientapp DB schema.
 // Scanner report 2026-11-22: clientapp accounts table has NO username / api_key columns.
-// Login BRImo pakai password saja (alias cuma UI label). Field whitelist now:
-// alias | password | callback_url | device_id | remote_ip  (5 fields).
+// Login BRImo pakai password saja (alias cuma UI label).
+// v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped from whitelist — auto-derived
+// from device_id via CGNAT regex at clientapp side (mirror UI readonly behavior).
+// keep_balance added — numeric "Sisakan Saldo Minimal (Rp)" matches clientapp modal.
+// Field whitelist: alias | password | callback_url | device_id | keep_balance (5 fields).
 const EDIT_FIELDS = [
     { key: 'alias',        label: 'Alias' },
     { key: 'password',     label: 'Password' },
     { key: 'callback_url', label: 'Callback URL' },
     { key: 'device_id',    label: 'Device ID' },
-    { key: 'remote_ip',    label: 'Remote IP' },
+    { key: 'keep_balance', label: 'Saldo Minimal (Rp)' },
 ];
 const SENSITIVE_EDIT_FIELDS = new Set(['password']);
 function maskForDisplay(field, value) {
@@ -44,19 +47,24 @@ function maskForDisplay(field, value) {
 // after callback_url collect `device_ip` (IP:PAIR_PORT shown on HP wireless
 // debugging dialog) + `pair_code` (6-digit shown with it). Backend sends
 // `adb pair <ip> <code>` to RDP via socket at Sprint 2e; scaffold returns 501.
+// Sprint 2e-3 (v4.3.9, 2026-11-22): keep_balance added — matches clientapp modal
+// field "Sisakan Saldo Minimal (Rp)". Integer ≥0. Accept `0` for no threshold.
 const ADD_STEPS = [
     { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (free text, space allowed, ≤128 chars). Example: <code>Toko A 123</code>' },
     { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> for BRImo login.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
     { key: 'callback_url', label: 'Callback URL', prompt: 'Send the <b>callback URL</b> (http:// or https://):' },
+    { key: 'keep_balance', label: 'Saldo Minimal',prompt: 'Send the <b>minimum balance to keep</b> (Rp, integer ≥0). Send <code>0</code> for no threshold.\n\n<i>Auto-transfer refuses to run if balance would fall below this amount.</i>' },
     { key: 'device_ip',    label: 'Device IP',    prompt: 'Send the <b>pair IP:port</b> shown on HP → Settings → Developer → Wireless debugging → <i>Pair device with pairing code</i>.\n\nFormat: <code>IP:PORT</code> (example <code>100.64.0.11:40123</code>). Port changes each time — use the pairing port, not the regular ADB port.' },
     { key: 'pair_code',    label: 'Pair code',    prompt: 'Send the <b>6-digit pair code</b> shown on HP alongside the IP above.\n\n<i>⚠️ Time-sensitive — expires when the HP\'s pairing dialog closes.</i>' },
 ];
 const SENSITIVE_ADD_FIELDS = new Set(['password', 'pair_code']);
 // Allow any printable char (space, digit, latin, Indonesian, special) — ban control chars only.
-const ALIAS_REGEX     = /^[^\x00-\x1F\x7F]{1,128}$/;
-const URL_REGEX       = /^https?:\/\/.+/i;
-const DEVICE_IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
-const PAIR_CODE_REGEX = /^\d{6}$/;
+const ALIAS_REGEX        = /^[^\x00-\x1F\x7F]{1,128}$/;
+const URL_REGEX          = /^https?:\/\/.+/i;
+const DEVICE_IP_REGEX    = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
+const PAIR_CODE_REGEX    = /^\d{6}$/;
+const KEEP_BALANCE_REGEX = /^\d+$/; // non-negative integer, no decimals/separators
+const KEEP_BALANCE_MAX   = 9_999_999_999; // 10B Rp practical ceiling
 
 function validateDeviceIp(value) {
     if (!DEVICE_IP_REGEX.test(value)) return false;
@@ -79,6 +87,10 @@ function validateAddField(key, value) {
         if (!validateDeviceIp(value)) return { ok: false, error: 'device_ip_bad_format' };
     } else if (key === 'pair_code') {
         if (!PAIR_CODE_REGEX.test(value)) return { ok: false, error: 'pair_code_bad_format' };
+    } else if (key === 'keep_balance') {
+        if (!KEEP_BALANCE_REGEX.test(value)) return { ok: false, error: 'keep_balance_bad_format' };
+        const n = parseInt(value, 10);
+        if (n < 0 || n > KEEP_BALANCE_MAX) return { ok: false, error: 'keep_balance_bad_range' };
     } else if (value.length > 1024) {
         return { ok: false, error: 'too_long_1024' };
     }
@@ -388,6 +400,13 @@ async function handleEditFieldPick(ctx) {
         await ctx.answerCbQuery('❌ Unknown field.', { show_alert: true });
         return;
     }
+
+    // Sprint 2e-3 (v4.3.9): device_id gets a dropdown of live devices from the RDP
+    // instead of free-text input. Mirrors clientapp modal behavior (<select>).
+    if (fieldKey === 'device_id') {
+        return handleEditFieldDeviceIdPick(ctx, active, fieldDef);
+    }
+
     try {
         await advanceWizard(r.chat_id, 'await_value', { field: fieldKey });
     } catch (e) {
@@ -396,7 +415,7 @@ async function handleEditFieldPick(ctx) {
     }
     const hint = SENSITIVE_EDIT_FIELDS.has(fieldKey)
         ? '\n\n<i>⚠️ Sensitive field — value won\'t be echoed in audit.</i>'
-        : '';
+        : (fieldKey === 'keep_balance' ? '\n\n<i>Integer ≥0 (Rp). Send <code>0</code> for no threshold.</i>' : '');
     try {
         await ctx.editMessageText(
             `✏️ <b>Edit account</b>\n\n` +
@@ -413,6 +432,165 @@ async function handleEditFieldPick(ctx) {
 }
 
 /**
+ * Sprint 2e-3: device_id picker. Queries clientapp for live ADB device list,
+ * renders InlineKeyboard with 1 button per device. Index-based callback_data
+ * (edit_dev:<idx>) stays well under Telegram's 64-byte cap regardless of serial
+ * length. Falls back to text input if no devices online or the query fails.
+ */
+async function handleEditFieldDeviceIdPick(ctx, active, fieldDef) {
+    const r = ctx.state.role;
+    const rdp = active.data.rdp_hostname;
+    await ctx.answerCbQuery(`Field: ${fieldDef.label}`);
+    const resp = await getJson(`/account/devices?rdp_hostname=${encodeURIComponent(rdp)}`);
+    const devices = Array.isArray(resp.data?.devices) ? resp.data.devices : [];
+
+    // No devices OR query failed → fall back to text input (keeps flow usable).
+    if (!resp.ok || devices.length === 0) {
+        const reason = !resp.ok
+            ? (resp.status === 502 ? 'RDP offline — clientapp not connected' :
+               resp.status === 504 ? 'RDP timed out (30s)' :
+               resp.data?.detail || 'query failed')
+            : 'no devices currently connected';
+        try {
+            await advanceWizard(r.chat_id, 'await_value', { field: 'device_id' });
+        } catch (_) {
+            await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+            return;
+        }
+        try {
+            await ctx.editMessageText(
+                `✏️ <b>Edit account</b>\n\n` +
+                `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+                `RDP: <code>${escapeHtml(rdp)}</code>\n` +
+                `Field: <b>Device ID</b>\n\n` +
+                `⚠️ Device dropdown unavailable: ${escapeHtml(reason)}.\n\n` +
+                `Send the device serial as text (e.g. <code>100.64.0.11:5555</code> or <code>R58N21ABC2</code>).\n\n` +
+                `<i>Or /cancel to abort.</i>`,
+                { parse_mode: 'HTML' }
+            );
+        } catch (_) {}
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:pick_field', args: `${active.data.alias}@${rdp}:device_id_fallback_text`, result: 'success', error_message: reason });
+        return;
+    }
+
+    // Cache the list in wizard state so edit_dev:<idx> callback can resolve
+    // without re-querying. Cap at 20 to stay well below Telegram's inline
+    // keyboard button limit + state_json size.
+    const capped = devices.slice(0, 20);
+    try {
+        await advanceWizard(r.chat_id, 'await_device_pick', { field: 'device_id', devices_cached: capped });
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    const buttons = capped.map((d, i) => ([
+        { text: (d.label || d.id).slice(0, 60), callback_data: `edit_dev:${i}` }
+    ]));
+    buttons.push([{ text: '✏️ Type manually', callback_data: 'edit_dev_manual' }]);
+    buttons.push([{ text: '❌ Cancel', callback_data: 'edit_cancel' }]);
+    try {
+        await ctx.editMessageText(
+            `✏️ <b>Edit account</b>\n\n` +
+            `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+            `RDP: <code>${escapeHtml(rdp)}</code>\n` +
+            `Field: <b>Device ID</b>\n\n` +
+            `Pick device (${capped.length} online):`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: buttons }
+            }
+        );
+    } catch (_) {}
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:pick_field', args: `${active.data.alias}@${rdp}:device_id (${capped.length} choices)`, result: 'success' });
+}
+
+/**
+ * Sprint 2e-3: user clicked a device in the dropdown.
+ * Resolves the index → serial from wizard.data.devices_cached, then advances
+ * to confirm (reuses existing handleEditConfirm path).
+ */
+async function handleEditDevicePick(ctx) {
+    const r = ctx.state.role;
+    const idxStr = ctx.match[1];
+    const idx = parseInt(idxStr, 10);
+    const active = await getActiveWizard(r.chat_id);
+    if (!active || active.wizard_type !== 'edit' || active.step !== 'await_device_pick') {
+        await ctx.answerCbQuery('⏱ Session expired. Start again with /edit.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Wizard expired or already handled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+    const cached = Array.isArray(active.data.devices_cached) ? active.data.devices_cached : [];
+    const picked = cached[idx];
+    if (!picked || typeof picked.id !== 'string') {
+        await ctx.answerCbQuery('❌ Device not found (list changed?).', { show_alert: true });
+        return;
+    }
+    try {
+        await advanceWizard(r.chat_id, 'confirm', { value: picked.id }, 'await_device_pick');
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    const fieldDef = EDIT_FIELDS.find(f => f.key === 'device_id');
+    try {
+        await ctx.editMessageText(
+            `⚠️ <b>Confirm edit</b>\n\n` +
+            `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+            `RDP: <code>${escapeHtml(active.data.rdp_hostname)}</code>\n` +
+            `Field: <b>${escapeHtml(fieldDef?.label || 'Device ID')}</b>\n` +
+            `New value: <code>${escapeHtml(picked.id)}</code>\n` +
+            `Device: <code>${escapeHtml((picked.label || picked.id).slice(0, 80))}</code>\n\n` +
+            `<i>Will stop the bot on this alias and auto-derive Remote IP from device_id.</i>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ YES, apply', callback_data: 'edit_confirm:ok' },
+                        { text: '❌ Cancel', callback_data: 'edit_confirm:no' }
+                    ]]
+                }
+            }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery(`Picked: ${picked.id}`);
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:device_pick', args: `${active.data.alias}@${active.data.rdp_hostname}:${picked.id}`, result: 'success' });
+}
+
+/**
+ * Sprint 2e-3: "Type manually" fallback from device-pick keyboard.
+ * Advances wizard to await_value so user can send free-text serial.
+ */
+async function handleEditDeviceManual(ctx) {
+    const r = ctx.state.role;
+    const active = await getActiveWizard(r.chat_id);
+    if (!active || active.wizard_type !== 'edit' || active.step !== 'await_device_pick') {
+        await ctx.answerCbQuery('⏱ Session expired. Start again with /edit.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Wizard expired or already handled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+    try {
+        // Clear devices_cached when going manual to keep state_json small.
+        await advanceWizard(r.chat_id, 'await_value', { field: 'device_id', devices_cached: null }, 'await_device_pick');
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    try {
+        await ctx.editMessageText(
+            `✏️ <b>Edit account</b>\n\n` +
+            `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+            `RDP: <code>${escapeHtml(active.data.rdp_hostname)}</code>\n` +
+            `Field: <b>Device ID</b>\n\n` +
+            `Send the device serial as text (e.g. <code>100.64.0.11:5555</code> or <code>R58N21ABC2</code>).\n\n` +
+            `<i>Or /cancel to abort.</i>`,
+            { parse_mode: 'HTML' }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery('Manual entry');
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:device_manual', args: `${active.data.alias}@${active.data.rdp_hostname}`, result: 'success' });
+}
+
+/**
  * Called from wizard text router when step === 'await_value'.
  * Returns true if handled (so router stops chain).
  */
@@ -426,6 +604,30 @@ async function handleEditValueInput(ctx, active) {
     if (value.length > 1024) {
         await ctx.reply(`❌ Value too long (${value.length} chars, max 1024).`, { parse_mode: 'HTML' });
         return true;
+    }
+    // Sprint 2e-3 (v4.3.9): per-field validation (defense in depth — mirrors /add
+    // validateAddField + REST /account/edit guards). Catches bad input before
+    // scaffold / round-trip call, so user sees inline error immediately.
+    if (active.data.field === 'keep_balance') {
+        if (!KEEP_BALANCE_REGEX.test(value)) {
+            await ctx.reply('❌ Saldo minimal must be a non-negative integer (no decimals, no separators). Send again or /cancel.', { parse_mode: 'HTML' });
+            return true;
+        }
+        const n = parseInt(value, 10);
+        if (n < 0 || n > KEEP_BALANCE_MAX) {
+            await ctx.reply(`❌ Saldo minimal out of range (0 to ${KEEP_BALANCE_MAX.toLocaleString('en-US')}). Send again or /cancel.`, { parse_mode: 'HTML' });
+            return true;
+        }
+    } else if (active.data.field === 'alias') {
+        if (!ALIAS_REGEX.test(value)) {
+            await ctx.reply('❌ Alias must be 1-128 printable chars (no control chars). Send again or /cancel.', { parse_mode: 'HTML' });
+            return true;
+        }
+    } else if (active.data.field === 'callback_url') {
+        if (!URL_REGEX.test(value) || value.length > 2048) {
+            await ctx.reply('❌ Callback URL must start with http:// or https:// (max 2048 chars). Send again or /cancel.', { parse_mode: 'HTML' });
+            return true;
+        }
     }
     try {
         await advanceWizard(r.chat_id, 'confirm', { value });
@@ -683,7 +885,9 @@ async function handleAddValueInput(ctx, active) {
             alias_bad_chars: 'Alias must be 1-128 printable chars (no control chars).',
             url_bad_scheme: 'Callback URL must start with http:// or https://.',
             device_ip_bad_format: 'Device IP must be IP:PORT (e.g. 100.64.0.11:40123). Port 1-65535, octets 0-255.',
-            pair_code_bad_format: 'Pair code must be exactly 6 digits.'
+            pair_code_bad_format: 'Pair code must be exactly 6 digits.',
+            keep_balance_bad_format: 'Saldo minimal must be a non-negative integer (no decimals, no separators).',
+            keep_balance_bad_range: `Saldo minimal out of range (0 to ${KEEP_BALANCE_MAX.toLocaleString('en-US')}).`
         };
         await ctx.reply(`❌ ${msgs[check.error] || check.error}\n\nSend the value again or /cancel.`, { parse_mode: 'HTML' });
         return true;
@@ -710,6 +914,7 @@ async function handleAddValueInput(ctx, active) {
 
     // All fields collected — show confirm page
     const merged = { ...active.data, ...mergeData };
+    const keepDisplay = `Rp ${parseInt(merged.keep_balance, 10).toLocaleString('id-ID')}`;
     const lines = [
         `⚠️ <b>Confirm new account</b>`,
         ``,
@@ -717,6 +922,7 @@ async function handleAddValueInput(ctx, active) {
         `Alias: <code>${escapeHtml(merged.alias)}</code>`,
         `Password: <code>${escapeHtml(maskAddForDisplay('password', merged.password))}</code>`,
         `Callback URL: <code>${escapeHtml(maskAddForDisplay('callback_url', merged.callback_url))}</code>`,
+        `Saldo Minimal: <code>${escapeHtml(keepDisplay)}</code>`,
         `Device IP: <code>${escapeHtml(merged.device_ip)}</code>`,
         `Pair code: <code>${escapeHtml(maskAddForDisplay('pair_code', merged.pair_code))}</code>`,
         ``,
@@ -761,9 +967,12 @@ async function handleAddConfirm(ctx) {
         return;
     }
 
-    const { alias, rdp_hostname, password, callback_url, device_ip, pair_code } = active.data;
+    const { alias, rdp_hostname, password, callback_url, keep_balance, device_ip, pair_code } = active.data;
+    const keepInt = parseInt(keep_balance, 10) || 0;
     const resp = await postJson('/account/add', {
-        alias, rdp_hostname, password, callback_url, device_ip, pair_code,
+        alias, rdp_hostname, password, callback_url,
+        keep_balance: keepInt,
+        device_ip, pair_code,
         operator_chat_id: r.chat_id
     });
 
@@ -797,7 +1006,7 @@ async function handleAddConfirm(ctx) {
         chat_id: r.chat_id,
         role: r.role,
         cmd: '/add:confirm',
-        args: `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`,
+        args: `${alias}@${rdp_hostname} dev=${device_ip} keep=${keepInt} cb=${callback_url.slice(0, 60)}`,
         result: auditResult,
         error_message: auditErrMsg
     });
@@ -830,5 +1039,6 @@ module.exports = {
     handleList, handleStatus,
     handleDelete, handleDeleteConfirm, handleDeleteCancel,
     handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction,
+    handleEditDevicePick, handleEditDeviceManual,
     handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction
 };

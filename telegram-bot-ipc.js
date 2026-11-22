@@ -152,16 +152,21 @@ router.get('/health', (req, res) => {
 // Field whitelist for /edit — gate what's editable from bot
 // v4.3.6 hotfix (scanner 2026-11-22): aligned with clientapp accounts table.
 // NO username / api_key columns exist. Login BRImo pakai password saja.
-// Editable: alias | password | callback_url | device_id | remote_ip (5 fields).
-// Deferred (need toggle/number validation): keep_balance, mutasi_enabled, mirror_enabled.
+// v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped (auto-derived at clientapp
+// via CGNAT regex, mirroring UI readonly behavior); keep_balance added (numeric
+// "Sisakan Saldo Minimal (Rp)"). Deferred: mutasi_enabled, mirror_enabled.
+// Editable: alias | password | callback_url | device_id | keep_balance (5 fields).
 // ==========================================================
-const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'remote_ip']);
+const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'keep_balance']);
 const SENSITIVE_FIELDS = new Set(['password']);
-const ALIAS_REGEX     = /^[^\x00-\x1F\x7F]{1,128}$/;
-const URL_REGEX       = /^https?:\/\/.+/i;
+const ALIAS_REGEX        = /^[^\x00-\x1F\x7F]{1,128}$/;
+const URL_REGEX          = /^https?:\/\/.+/i;
 // Sprint 2d-2 (v4.3.7): ADB pair fields for /add.
-const DEVICE_IP_REGEX = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
-const PAIR_CODE_REGEX = /^\d{6}$/;
+const DEVICE_IP_REGEX    = /^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
+const PAIR_CODE_REGEX    = /^\d{6}$/;
+// Sprint 2e-3 (v4.3.9): keep_balance numeric field.
+const KEEP_BALANCE_REGEX = /^\d+$/;
+const KEEP_BALANCE_MAX   = 9_999_999_999;
 function isValidDeviceIp(v) {
     if (typeof v !== 'string' || !DEVICE_IP_REGEX.test(v)) return false;
     const [ipPart, portPart] = v.split(':');
@@ -169,6 +174,17 @@ function isValidDeviceIp(v) {
     if (octets.some(o => o < 0 || o > 255 || Number.isNaN(o))) return false;
     const port = parseInt(portPart, 10);
     return !Number.isNaN(port) && port >= 1 && port <= 65535;
+}
+function coerceKeepBalance(v) {
+    // Accepts number OR numeric string, returns {ok, value} or {ok:false, error}.
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= KEEP_BALANCE_MAX) {
+        return { ok: true, value: v };
+    }
+    if (typeof v === 'string' && KEEP_BALANCE_REGEX.test(v)) {
+        const n = parseInt(v, 10);
+        if (n >= 0 && n <= KEEP_BALANCE_MAX) return { ok: true, value: n };
+    }
+    return { ok: false, error: 'invalid_keep_balance' };
 }
 
 function maskedArgs(alias, rdp, field, value) {
@@ -226,7 +242,7 @@ router.post('/account/delete', async (req, res) => {
 // v4.3.7 (Sprint 2d-2): device_ip + pair_code added per Q2=C ADB pair step.
 // Response: 501 — clientapp support (DB insert + `adb pair` relay) coming Sprint 2e.
 router.post('/account/add', async (req, res) => {
-    const { alias, rdp_hostname, password, callback_url, device_ip, pair_code, operator_chat_id } = req.body || {};
+    const { alias, rdp_hostname, password, callback_url, keep_balance, device_ip, pair_code, operator_chat_id } = req.body || {};
     const missing = [];
     if (!alias) missing.push('alias');
     if (!rdp_hostname) missing.push('rdp_hostname');
@@ -255,6 +271,15 @@ router.post('/account/add', async (req, res) => {
     if (typeof pair_code !== 'string' || !PAIR_CODE_REGEX.test(pair_code)) {
         return res.status(400).json({ error: 'invalid_pair_code', detail: 'exactly 6 digits' });
     }
+    // Sprint 2e-3 (v4.3.9): keep_balance optional — default 0 if omitted (back-compat).
+    let keepBalanceCoerced = 0;
+    if (keep_balance !== undefined && keep_balance !== null && keep_balance !== '') {
+        const kb = coerceKeepBalance(keep_balance);
+        if (!kb.ok) {
+            return res.status(400).json({ error: 'invalid_keep_balance', detail: `non-negative integer, 0 to ${KEEP_BALANCE_MAX}` });
+        }
+        keepBalanceCoerced = kb.value;
+    }
 
     // Validate scope
     const scopeCheck = await validateOperatorScope(operator_chat_id, rdp_hostname);
@@ -270,10 +295,12 @@ router.post('/account/add', async (req, res) => {
     }
 
     // Sprint 2e (v4.3.8): round-trip to clientapp — clientapp runs adb pair + DB insert.
+    // v4.3.9 / Sprint 2e-3: keep_balance (coerced) forwarded; clientapp binds directly.
     const rt = await callClientapp(rdp_hostname, 'tg:account_create', {
-        alias, password, callback_url, device_ip, pair_code
+        alias, password, callback_url, device_ip, pair_code,
+        keep_balance: keepBalanceCoerced
     });
-    const auditArgs = `${alias}@${rdp_hostname} dev=${device_ip} cb=${callback_url.slice(0, 60)}`;
+    const auditArgs = `${alias}@${rdp_hostname} dev=${device_ip} keep=${keepBalanceCoerced} cb=${callback_url.slice(0, 60)}`;
     const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
     const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
     try {
@@ -317,10 +344,16 @@ router.post('/account/edit', async (req, res) => {
     if (typeof value !== 'string' || !value.length) {
         return res.status(400).json({ error: 'invalid_value', detail: 'value must be non-empty string' });
     }
+    // Sprint 2e-3 (v4.3.9): coerce keep_balance here; forwards numeric to clientapp.
+    let forwardedValue = value;
     if (field === 'alias') {
         if (!ALIAS_REGEX.test(value)) return res.status(400).json({ error: 'invalid_alias', detail: 'printable chars only, 1-128 length' });
     } else if (field === 'callback_url') {
         if (!URL_REGEX.test(value) || value.length > 2048) return res.status(400).json({ error: 'invalid_callback_url', detail: 'must be http(s)://... ≤2048 chars' });
+    } else if (field === 'keep_balance') {
+        const kb = coerceKeepBalance(value);
+        if (!kb.ok) return res.status(400).json({ error: 'invalid_keep_balance', detail: `non-negative integer, 0 to ${KEEP_BALANCE_MAX}` });
+        forwardedValue = kb.value;
     } else if (value.length > 1024) {
         return res.status(400).json({ error: 'invalid_value', detail: 'value must be ≤1024 chars' });
     }
@@ -339,7 +372,7 @@ router.post('/account/edit', async (req, res) => {
     }
 
     // Sprint 2e (v4.3.8): round-trip to clientapp — clientapp updates account row + bumps updated_at.
-    const rt = await callClientapp(rdp_hostname, 'tg:account_edit', { alias, field, value });
+    const rt = await callClientapp(rdp_hostname, 'tg:account_edit', { alias, field, value: forwardedValue });
     const auditArgsStr = maskedArgs(alias, rdp_hostname, field, value);
     const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
     const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
@@ -354,6 +387,25 @@ router.post('/account/edit', async (req, res) => {
     }
     if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
     return res.json({ ok: true, ...rt.result });
+});
+
+// GET /api/tg/account/devices?rdp_hostname=X
+// Sprint 2e-3 (v4.3.9): returns ADB device list live from target clientapp, used
+// by /edit device_id picker to show a dropdown instead of free-text input.
+// Round-trip via `tg:devices_query` control-socket event; clientapp acks with
+// `tg:devices_ack` carrying `{ ok, devices: [{id, label}] }`.
+router.get('/account/devices', async (req, res) => {
+    const rdp_hostname = req.query?.rdp_hostname;
+    if (!rdp_hostname) {
+        return res.status(400).json({ error: 'missing_fields', detail: 'required: rdp_hostname' });
+    }
+    // Note: no scope check on this read-only endpoint — the bot's /edit flow
+    // already verified scope before issuing the pick_field callback, so by the
+    // time the dropdown fetch happens the operator's scope has been validated.
+    const rt = await callClientapp(rdp_hostname, 'tg:devices_query', {});
+    if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
+    const devices = Array.isArray(rt.result?.devices) ? rt.result.devices : [];
+    return res.json({ ok: true, devices });
 });
 
 module.exports = { router, setDb, setEmitter, resolveAck };

@@ -31,8 +31,13 @@ function registerHandlers(bot) {
     bot.action(/^del_no:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteCancel);
 
     // Sprint 2c + v4.3.6 hotfix: /edit wizard inline-button callbacks
-    // Field whitelist realigned to clientapp schema (dropped username + api_key).
-    bot.action(/^edit_field:(alias|password|callback_url|device_id|remote_ip)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
+    // v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped (auto-derived at clientapp),
+    // keep_balance added (numeric "Saldo Minimal"). device_id picker uses edit_dev:<idx>
+    // from a per-wizard cached device list (max 20) — index-based so callback_data
+    // stays tiny regardless of serial length.
+    bot.action(/^edit_field:(alias|password|callback_url|device_id|keep_balance)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
+    bot.action(/^edit_dev:(\d{1,2})$/, requireRole(['owner', 'operator']), op.handleEditDevicePick);
+    bot.action(/^edit_dev_manual$/, requireRole(['owner', 'operator']), op.handleEditDeviceManual);
     bot.action(/^edit_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleEditConfirm);
     bot.action(/^edit_cancel$/, requireRole(['owner', 'operator']), op.handleEditCancelAction);
 

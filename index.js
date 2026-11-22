@@ -1577,6 +1577,13 @@ function setupBotNamespace(app_source) {
             catch (e) { console.error('[tg-ctrl] resolveAck threw:', e.message); }
         });
 
+        // Sprint 2e-3 (v4.3.9): ack dispatch for /api/tg/account/devices (device list query
+        // from /edit device_id picker). Uses the same request_id → pending-map resolver.
+        socket.on('tg:devices_ack', (payload) => {
+            try { tgIpc.resolveAck(payload); }
+            catch (e) { console.error('[tg-ctrl] devices_ack resolveAck threw:', e.message); }
+        });
+
         socket.on('disconnect', async (reason) => {
             // Sprint 2e (v4.3.8): control-plane socket cleanup. Runs first — control sockets
             // don't have bot_id so the bot cleanup path below short-circuits for them.
