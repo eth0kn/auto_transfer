@@ -3,6 +3,7 @@
 
 const { logAudit } = require('../audit');
 const { notifyOwnerUnknown } = require('../shadow');
+const { escapeHtml } = require('../util');
 
 async function handleStart(ctx) {
     const r = ctx.state.role;
@@ -13,16 +14,16 @@ async function handleStart(ctx) {
     }[r.role] || '❓';
 
     const text = [
-        `🤖 *Auto-Transfer Bot*`,
+        `🤖 <b>Auto-Transfer Bot</b>`,
         ``,
         `Welcome. You are: ${roleLabel}`,
         ``,
         `Commands:`,
-        `• \`/whoami\` — show your role`,
-        `• \`/help\` — list commands available for your role`
+        `• <code>/whoami</code> — show your role`,
+        `• <code>/help</code> — list commands available for your role`
     ].join('\n');
 
-    await ctx.reply(text, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'HTML' });
     await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/start', result: 'success' });
 
     // Unknown user attempting /start → notify owner (so they can decide to approve)
@@ -37,29 +38,29 @@ async function handleWhoami(ctx) {
     let text;
 
     if (r.role === 'owner') {
-        text = `👑 *Owner*\nchat_id: \`${chat_id}\`\nAll commands available.`;
+        text = `👑 <b>Owner</b>\nID: <code>${escapeHtml(chat_id)}</code>\nAll commands available.`;
     } else if (r.role === 'operator') {
         const op = r.operator;
         const scope = op.allowed_rdp_hostnames
             ? JSON.parse(op.allowed_rdp_hostnames).join(', ')
             : 'all approved RDPs';
         text = [
-            `👤 *Operator (approved)*`,
-            `chat_id: \`${chat_id}\``,
-            `display_name: ${op.display_name || '-'}`,
-            `scope: ${scope}`,
-            `approved_at: ${op.approved_at || '-'}`
+            `👤 <b>Operator (approved)</b>`,
+            `ID: <code>${escapeHtml(chat_id)}</code>`,
+            `Name: ${escapeHtml(op.display_name || '-')}`,
+            `Scope: ${escapeHtml(scope)}`,
+            `Approved at: ${escapeHtml(op.approved_at || '-')}`
         ].join('\n');
     } else {
         text = [
-            `❓ *Unknown*`,
-            `chat_id: \`${chat_id}\``,
+            `❓ <b>Unknown</b>`,
+            `ID: <code>${escapeHtml(chat_id)}</code>`,
             ``,
             `You are not registered. Contact owner to add you as operator.`
         ].join('\n');
     }
 
-    await ctx.reply(text, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'HTML' });
     await logAudit({ chat_id: r.chat_id || 'unknown', role: r.role, cmd: '/whoami', result: 'success' });
 }
 
@@ -69,51 +70,51 @@ async function handleHelp(ctx) {
 
     if (r.role === 'owner') {
         text = [
-            `👑 *Owner Commands*`,
+            `👑 <b>Owner Commands</b>`,
             ``,
-            `*Public*`,
-            `• \`/start\`, \`/whoami\`, \`/help\``,
+            `<b>Public</b>`,
+            `• <code>/start</code>, <code>/whoami</code>, <code>/help</code>`,
             ``,
-            `*RDP Management*`,
-            `• \`/list_rdp\` — list all registered RDPs`,
-            `• \`/approve_rdp <hostname>\` — approve pending RDP`,
-            `• \`/revoke_rdp <hostname>\` — revoke RDP`,
+            `<b>RDP Management</b>`,
+            `• <code>/list_rdp</code> — list all registered RDPs`,
+            `• <code>/approve_rdp &lt;hostname&gt;</code> — approve pending RDP`,
+            `• <code>/revoke_rdp &lt;hostname&gt;</code> — revoke RDP`,
             ``,
-            `*Operator Management*`,
-            `• \`/list_operators\` — list all operators`,
-            `• \`/create_operator <chat_id> <display_name>\` — add operator (auto-approved)`,
-            `• \`/revoke_operator <chat_id>\` — revoke operator`,
-            `• \`/delete_operator <chat_id>\` — hard delete`,
+            `<b>Operator Management</b>`,
+            `• <code>/list_operators</code> — list all operators`,
+            `• <code>/create_operator &lt;chat_id&gt; &lt;display_name&gt;</code> — add operator (auto-approved)`,
+            `• <code>/revoke_operator &lt;chat_id&gt;</code> — revoke operator`,
+            `• <code>/delete_operator &lt;chat_id&gt;</code> — hard delete`,
             ``,
-            `*Observability*`,
-            `• \`/shadow on|off|filter <level>\` — control shadow forward`,
-            `• \`/audit [chat_id] [limit]\` — view audit log`,
+            `<b>Observability</b>`,
+            `• <code>/shadow on|off|filter &lt;level&gt;</code> — control shadow forward`,
+            `• <code>/audit [chat_id] [limit]</code> — view audit log`,
             ``,
-            `_Sprint 2+ (coming): /add /edit /delete /start-bot /stop-bot_`
+            `<i>Sprint 2+ (coming): /add /edit /delete /start_bot /stop_bot</i>`
         ].join('\n');
     } else if (r.role === 'operator') {
         text = [
-            `👤 *Operator Commands*`,
+            `👤 <b>Operator Commands</b>`,
             ``,
-            `• \`/whoami\` — your role info`,
-            `• \`/list\` — list your accessible accounts (coming Sprint 2)`,
-            `• \`/status\` — RDP + bot health (coming Sprint 2)`,
+            `• <code>/whoami</code> — your role info`,
+            `• <code>/list</code> — list your accessible accounts (coming Sprint 2)`,
+            `• <code>/status</code> — RDP + bot health (coming Sprint 2)`,
             ``,
-            `_Sprint 2+ (coming): /add /edit /delete /start-bot /stop-bot_`,
-            `_Contact owner if you need more access._`
+            `<i>Sprint 2+ (coming): /add /edit /delete /start_bot /stop_bot</i>`,
+            `<i>Contact owner if you need more access.</i>`
         ].join('\n');
     } else {
         text = [
-            `❓ *Unknown User*`,
+            `❓ <b>Unknown User</b>`,
             ``,
             `You are not registered as owner or operator.`,
-            `Available: \`/start\`, \`/whoami\`, \`/help\``,
+            `Available: <code>/start</code>, <code>/whoami</code>, <code>/help</code>`,
             ``,
             `Contact owner with your chat_id to request access.`
         ].join('\n');
     }
 
-    await ctx.reply(text, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'HTML' });
     await logAudit({ chat_id: r.chat_id || 'unknown', role: r.role, cmd: '/help', result: 'success' });
 }
 

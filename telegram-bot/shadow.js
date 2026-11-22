@@ -53,16 +53,17 @@ async function forwardToOwner({ ctx, operatorChatId, operatorLabel, cmd, result,
     if (String(operatorChatId) === String(ownerChatId)) return; // self — skip
 
     const icon = eventType === 'error' ? '🔴' : (eventType === 'denied' ? '🚫' : (eventType === 'destructive' ? '⚠️' : '👁'));
+    const { escapeHtml } = require('./util');
     const text = [
-        `${icon} *Shadow: operator activity*`,
-        `👤 ${operatorLabel} (chat ${operatorChatId})`,
-        `💬 \`${cmd}\``,
-        `→ ${result}`,
-        `⏱ ${nowWIB()}`
+        `${icon} <b>Shadow: operator activity</b>`,
+        `👤 ${escapeHtml(operatorLabel)} (chat ${escapeHtml(operatorChatId)})`,
+        `💬 <code>${escapeHtml(cmd)}</code>`,
+        `→ ${escapeHtml(result)}`,
+        `⏱ ${escapeHtml(nowWIB())}`
     ].join('\n');
 
     try {
-        await ctx.telegram.sendMessage(ownerChatId, text, { parse_mode: 'Markdown' });
+        await ctx.telegram.sendMessage(ownerChatId, text, { parse_mode: 'HTML' });
     } catch (e) {
         console.error('[shadow] forward failed:', e.message);
     }
@@ -90,18 +91,19 @@ async function notifyOwnerDenied(ctx, cmd) {
 async function notifyOwnerUnknown(ctx, cmd) {
     const ownerChatId = process.env.OWNER_CHAT_ID;
     if (!ownerChatId) return;
+    const { escapeHtml } = require('./util');
     const from = ctx.message?.from;
     const label = from ? `${from.first_name || '?'}${from.username ? ' @' + from.username : ''}` : '?';
     const text = [
-        `⚠️ *Unknown user attempted command*`,
-        `👤 ${label} (chat ${from?.id || '?'})`,
-        `💬 \`${cmd}\``,
-        `⏱ ${nowWIB()}`,
+        `⚠️ <b>Unknown user attempted command</b>`,
+        `👤 ${escapeHtml(label)} (chat ${escapeHtml(from?.id || '?')})`,
+        `💬 <code>${escapeHtml(cmd)}</code>`,
+        `⏱ ${escapeHtml(nowWIB())}`,
         ``,
-        `Approve as operator: \`/create_operator ${from?.id || 'CHAT_ID'} <display_name>\``
+        `Approve as operator: <code>/create_operator ${escapeHtml(from?.id || 'CHAT_ID')} &lt;display_name&gt;</code>`
     ].join('\n');
     try {
-        await ctx.telegram.sendMessage(ownerChatId, text, { parse_mode: 'Markdown' });
+        await ctx.telegram.sendMessage(ownerChatId, text, { parse_mode: 'HTML' });
     } catch (e) {
         console.error('[shadow] notifyOwnerUnknown failed:', e.message);
     }

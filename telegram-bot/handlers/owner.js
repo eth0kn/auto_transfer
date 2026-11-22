@@ -3,6 +3,7 @@
 
 const { pool } = require('../db');
 const { logAudit } = require('../audit');
+const { escapeHtml } = require('../util');
 
 // ==========================================================
 // RDP Management
@@ -16,7 +17,7 @@ async function handleListRdp(ctx) {
              FROM rdp_registry ORDER BY status, rdp_hostname`
         );
         if (rows.length === 0) {
-            await ctx.reply('📋 No RDPs registered yet.\n\n_RDPs auto-register when clientapp connects._');
+            await ctx.reply('📋 No RDPs registered yet.\n\n<i>RDPs auto-register when clientapp connects.</i>', { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list_rdp', result: 'success' });
             return;
         }
@@ -24,15 +25,15 @@ async function handleListRdp(ctx) {
         for (const row of rows) {
             const icon = row.status === 'approved' ? '✅' : (row.status === 'pending' ? '⏳' : '🚫');
             sections[row.status]?.push(
-                `${icon} \`${row.rdp_hostname}\`\n   IP: ${row.last_ts_ip || '-'}${row.bound_ts_ip ? ` (bound ${row.bound_ts_ip})` : ''}\n   last seen: ${row.last_seen_at}`
+                `${icon} <code>${escapeHtml(row.rdp_hostname)}</code>\n   IP: ${escapeHtml(row.last_ts_ip || '-')}${row.bound_ts_ip ? ` (bound ${escapeHtml(row.bound_ts_ip)})` : ''}\n   last seen: ${escapeHtml(row.last_seen_at)}`
             );
         }
         const parts = [];
-        if (sections.pending.length) parts.push(`*⏳ Pending (${sections.pending.length})*\n${sections.pending.join('\n')}`);
-        if (sections.approved.length) parts.push(`*✅ Approved (${sections.approved.length})*\n${sections.approved.join('\n')}`);
-        if (sections.revoked.length) parts.push(`*🚫 Revoked (${sections.revoked.length})*\n${sections.revoked.join('\n')}`);
+        if (sections.pending.length) parts.push(`<b>⏳ Pending (${sections.pending.length})</b>\n${sections.pending.join('\n')}`);
+        if (sections.approved.length) parts.push(`<b>✅ Approved (${sections.approved.length})</b>\n${sections.approved.join('\n')}`);
+        if (sections.revoked.length) parts.push(`<b>🚫 Revoked (${sections.revoked.length})</b>\n${sections.revoked.join('\n')}`);
 
-        await ctx.reply(`📋 *RDP Registry*\n\n${parts.join('\n\n')}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📋 <b>RDP Registry</b>\n\n${parts.join('\n\n')}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list_rdp', result: 'success' });
     } catch (e) {
         console.error('[handler /list_rdp]', e.message);
@@ -46,7 +47,7 @@ async function handleApproveRdp(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
-        await ctx.reply('Usage: `/approve_rdp <hostname>`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: <code>/approve_rdp &lt;hostname&gt;</code>', { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/approve_rdp', result: 'rejected', error_message: 'missing_arg' });
         return;
     }
@@ -58,19 +59,19 @@ async function handleApproveRdp(ctx) {
             [hostname]
         );
         if (rows.length === 0) {
-            await ctx.reply(`❌ RDP \`${hostname}\` not found in registry.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ RDP <code>${escapeHtml(hostname)}</code> not found in registry.`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/approve_rdp', args: hostname, result: 'error', error_message: 'not_found' });
             return;
         }
         if (rows[0].status === 'approved') {
-            await ctx.reply(`ℹ️ RDP \`${hostname}\` already approved.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`ℹ️ RDP <code>${escapeHtml(hostname)}</code> already approved.`, { parse_mode: 'HTML' });
             return;
         }
         await pool.execute(
             `UPDATE rdp_registry SET status = 'approved', approved_by = ?, approved_at = NOW(), bound_ts_ip = ?, revoked_at = NULL WHERE rdp_hostname = ?`,
             [r.chat_id, rows[0].last_ts_ip, hostname]
         );
-        await ctx.reply(`✅ RDP \`${hostname}\` approved.\n   Bound IP: ${rows[0].last_ts_ip || '-'}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`✅ RDP <code>${escapeHtml(hostname)}</code> approved.\n   Bound IP: ${escapeHtml(rows[0].last_ts_ip || '-')}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/approve_rdp', args: hostname, result: 'success' });
     } catch (e) {
         console.error('[handler /approve_rdp]', e.message);
@@ -84,7 +85,7 @@ async function handleRevokeRdp(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
-        await ctx.reply('Usage: `/revoke_rdp <hostname>`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: <code>/revoke_rdp &lt;hostname&gt;</code>', { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_rdp', result: 'rejected', error_message: 'missing_arg' });
         return;
     }
@@ -96,11 +97,11 @@ async function handleRevokeRdp(ctx) {
             [hostname]
         );
         if (result.affectedRows === 0) {
-            await ctx.reply(`❌ RDP \`${hostname}\` not found or already revoked.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ RDP <code>${escapeHtml(hostname)}</code> not found or already revoked.`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_rdp', args: hostname, result: 'error', error_message: 'not_found_or_already_revoked' });
             return;
         }
-        await ctx.reply(`🚫 RDP \`${hostname}\` revoked.\n\n_Note: Sprint 1 only marks DB — kick+stop enforcement Sprint 3._`, { parse_mode: 'Markdown' });
+        await ctx.reply(`🚫 RDP <code>${escapeHtml(hostname)}</code> revoked.\n\n<i>Note: Sprint 1 only marks DB — kick+stop enforcement Sprint 3.</i>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_rdp', args: hostname, result: 'success' });
     } catch (e) {
         console.error('[handler /revoke_rdp]', e.message);
@@ -121,14 +122,14 @@ async function handleListOperators(ctx) {
              FROM operators ORDER BY status, chat_id`
         );
         if (rows.length === 0) {
-            await ctx.reply('📋 No operators registered yet.\n\n_Add via /create_operator <chat_id> <display_name>_');
+            await ctx.reply('📋 No operators registered yet.\n\n<i>Add via /create_operator &lt;chat_id&gt; &lt;display_name&gt;</i>', { parse_mode: 'HTML' });
             return;
         }
         const lines = rows.map(o => {
             const icon = o.status === 'approved' ? '✅' : (o.status === 'pending' ? '⏳' : (o.status === 'revoked' ? '🚫' : '❌'));
-            return `${icon} \`${o.chat_id}\` — ${o.display_name || '-'}${o.username ? ' @' + o.username : ''}\n   status: ${o.status}, last active: ${o.last_active_at || '-'}`;
+            return `${icon} <code>${escapeHtml(o.chat_id)}</code> — ${escapeHtml(o.display_name || '-')}${o.username ? ' @' + escapeHtml(o.username) : ''}\n   status: ${escapeHtml(o.status)}, last active: ${escapeHtml(o.last_active_at || '-')}`;
         });
-        await ctx.reply(`📋 *Operators*\n\n${lines.join('\n\n')}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📋 <b>Operators</b>\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list_operators', result: 'success' });
     } catch (e) {
         console.error('[handler /list_operators]', e.message);
@@ -142,7 +143,7 @@ async function handleCreateOperator(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.split(/\s+/);
     if (parts.length < 3) {
-        await ctx.reply('Usage: `/create_operator <chat_id> <display_name>`\n\nExample: `/create_operator 123456789 Fajar`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: <code>/create_operator &lt;chat_id&gt; &lt;display_name&gt;</code>\n\nExample: <code>/create_operator 123456789 Fajar</code>', { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/create_operator', result: 'rejected', error_message: 'missing_args' });
         return;
     }
@@ -150,7 +151,7 @@ async function handleCreateOperator(ctx) {
     const displayName = parts.slice(2).join(' ');
 
     if (!/^\d+$/.test(chatId)) {
-        await ctx.reply(`❌ chat_id must be numeric string. Got: \`${chatId}\``, { parse_mode: 'Markdown' });
+        await ctx.reply(`❌ chat_id must be numeric string. Got: <code>${escapeHtml(chatId)}</code>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/create_operator', args: chatId, result: 'rejected', error_message: 'invalid_chat_id_format' });
         return;
     }
@@ -167,11 +168,11 @@ async function handleCreateOperator(ctx) {
              VALUES (?, ?, 'approved', ?, NOW())`,
             [chatId, displayName, r.chat_id]
         );
-        await ctx.reply(`✅ Operator created & approved.\n   chat_id: \`${chatId}\`\n   display_name: ${displayName}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`✅ Operator created &amp; approved.\n   ID: <code>${escapeHtml(chatId)}</code>\n   Name: ${escapeHtml(displayName)}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/create_operator', args: `${chatId} ${displayName}`, result: 'success' });
     } catch (e) {
         if (e.code === 'ER_DUP_ENTRY') {
-            await ctx.reply(`❌ Operator with chat_id \`${chatId}\` already exists.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ Operator with ID <code>${escapeHtml(chatId)}</code> already exists.`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/create_operator', args: chatId, result: 'error', error_message: 'duplicate' });
         } else {
             console.error('[handler /create_operator]', e.message);
@@ -186,7 +187,7 @@ async function handleRevokeOperator(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
-        await ctx.reply('Usage: `/revoke_operator <chat_id>`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: <code>/revoke_operator &lt;chat_id&gt;</code>', { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', result: 'rejected', error_message: 'missing_arg' });
         return;
     }
@@ -198,11 +199,11 @@ async function handleRevokeOperator(ctx) {
             [chatId]
         );
         if (result.affectedRows === 0) {
-            await ctx.reply(`❌ Operator \`${chatId}\` not found or already revoked.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ Operator <code>${escapeHtml(chatId)}</code> not found or already revoked.`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'error', error_message: 'not_found' });
             return;
         }
-        await ctx.reply(`🚫 Operator \`${chatId}\` revoked.\n\n_D5: Sprint 3 will enforce kick + stop running bots. Sprint 1 only marks DB._`, { parse_mode: 'Markdown' });
+        await ctx.reply(`🚫 Operator <code>${escapeHtml(chatId)}</code> revoked.\n\n<i>D5: Sprint 3 will enforce kick + stop running bots. Sprint 1 only marks DB.</i>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'success' });
     } catch (e) {
         console.error('[handler /revoke_operator]', e.message);
@@ -216,7 +217,7 @@ async function handleDeleteOperator(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.split(/\s+/);
     if (parts.length < 2) {
-        await ctx.reply('Usage: `/delete_operator <chat_id>`\n\n⚠️ _Hard delete — audit trail lost. Prefer /revoke_operator._', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: <code>/delete_operator &lt;chat_id&gt;</code>\n\n⚠️ <i>Hard delete — audit trail lost. Prefer /revoke_operator.</i>', { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete_operator', result: 'rejected', error_message: 'missing_arg' });
         return;
     }
@@ -228,11 +229,11 @@ async function handleDeleteOperator(ctx) {
             [chatId]
         );
         if (result.affectedRows === 0) {
-            await ctx.reply(`❌ Operator \`${chatId}\` not found.`, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ Operator <code>${escapeHtml(chatId)}</code> not found.`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete_operator', args: chatId, result: 'error', error_message: 'not_found' });
             return;
         }
-        await ctx.reply(`🗑️ Operator \`${chatId}\` hard-deleted.`, { parse_mode: 'Markdown' });
+        await ctx.reply(`🗑️ Operator <code>${escapeHtml(chatId)}</code> hard-deleted.`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete_operator', args: chatId, result: 'success' });
     } catch (e) {
         console.error('[handler /delete_operator]', e.message);
@@ -256,13 +257,13 @@ async function handleShadow(ctx) {
             filter: process.env.TG_SHADOW_FILTER || 'all'
         };
         await ctx.reply(
-            `👁 *Shadow Observability*\n\n` +
-            `Current: enabled=${current.enabled}, filter=${current.filter}\n\n` +
+            `👁 <b>Shadow Observability</b>\n\n` +
+            `Current: enabled=${escapeHtml(current.enabled)}, filter=${escapeHtml(current.filter)}\n\n` +
             `Usage:\n` +
-            `• \`/shadow on\` / \`/shadow off\`\n` +
-            `• \`/shadow filter all|destructive|errors\`\n\n` +
-            `_Note: Sprint 1 — env vars set at bot start. Runtime toggle: Sprint 2+ persistent store._`,
-            { parse_mode: 'Markdown' }
+            `• <code>/shadow on</code> / <code>/shadow off</code>\n` +
+            `• <code>/shadow filter all|destructive|errors</code>\n\n` +
+            `<i>Note: Sprint 1 — env vars set at bot start. Runtime toggle: Sprint 2+ persistent store.</i>`,
+            { parse_mode: 'HTML' }
         );
         return;
     }
@@ -278,14 +279,14 @@ async function handleShadow(ctx) {
     } else if (action === 'filter') {
         const level = parts[2]?.toLowerCase();
         if (!['all', 'destructive', 'errors'].includes(level)) {
-            await ctx.reply(`❌ Invalid filter. Use: \`all\`, \`destructive\`, or \`errors\``, { parse_mode: 'Markdown' });
+            await ctx.reply(`❌ Invalid filter. Use: <code>all</code>, <code>destructive</code>, or <code>errors</code>`, { parse_mode: 'HTML' });
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'invalid_filter' });
             return;
         }
         process.env.TG_SHADOW_FILTER = level;
-        await ctx.reply(`✅ Shadow filter: \`${level}\` (runtime only)`, { parse_mode: 'Markdown' });
+        await ctx.reply(`✅ Shadow filter: <code>${escapeHtml(level)}</code> (runtime only)`, { parse_mode: 'HTML' });
     } else {
-        await ctx.reply(`❌ Unknown action. Use: \`/shadow on|off|filter <level>\``, { parse_mode: 'Markdown' });
+        await ctx.reply(`❌ Unknown action. Use: <code>/shadow on|off|filter &lt;level&gt;</code>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'unknown_action' });
         return;
     }
@@ -330,10 +331,10 @@ async function handleAudit(ctx) {
         }
         const lines = rows.map(x => {
             const icon = x.result === 'success' ? '✅' : (x.result === 'denied' ? '🚫' : (x.result === 'error' ? '🔴' : '⚠️'));
-            return `${icon} \`${x.chat_id}\` [${x.role}] ${x.cmd || '-'}${x.args ? ' ' + x.args : ''} — ${x.result}${x.error_message ? ' (' + x.error_message + ')' : ''}\n   ${x.created_at}`;
+            return `${icon} <code>${escapeHtml(x.chat_id)}</code> [${escapeHtml(x.role)}] ${escapeHtml(x.cmd || '-')}${x.args ? ' ' + escapeHtml(x.args) : ''} — ${escapeHtml(x.result)}${x.error_message ? ' (' + escapeHtml(x.error_message) + ')' : ''}\n   ${escapeHtml(x.created_at)}`;
         });
-        const header = chatIdFilter ? `*Audit log for ${chatIdFilter}* (last ${limit})` : `*Audit log* (last ${limit})`;
-        await ctx.reply(`${header}\n\n${lines.join('\n\n')}`, { parse_mode: 'Markdown' });
+        const header = chatIdFilter ? `<b>Audit log for ${escapeHtml(chatIdFilter)}</b> (last ${limit})` : `<b>Audit log</b> (last ${limit})`;
+        await ctx.reply(`${header}\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/audit', args: parts.slice(1).join(' '), result: 'success' });
     } catch (e) {
         console.error('[handler /audit]', e.message);

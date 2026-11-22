@@ -106,7 +106,8 @@ function requireRole(allowedRoles) {
         const r = ctx.state.role;
         if (!allowedRoles.includes(r.role)) {
             const cmd = ctx.message?.text?.split(' ')[0] || 'unknown';
-            await ctx.reply(`❌ Insufficient permission.\nYou are: *${r.role}*\nRequired: *${allowedRoles.join(' or ')}*`, { parse_mode: 'Markdown' });
+            const { escapeHtml } = require('./util');
+            await ctx.reply(`❌ Insufficient permission.\nYou are: <b>${escapeHtml(r.role)}</b>\nRequired: <b>${escapeHtml(allowedRoles.join(' or '))}</b>`, { parse_mode: 'HTML' });
             await logAudit({
                 chat_id: r.chat_id,
                 role: r.role,

@@ -40,7 +40,8 @@ function registerHandlers(bot) {
         if (text.startsWith('/')) {
             const r = ctx.state.role;
             if (r.role === 'rejected') return; // middleware already replied
-            await ctx.reply(`❓ Unknown command: \`${text.split(' ')[0]}\`\n\nUse \`/help\` to see available commands.`, { parse_mode: 'Markdown' });
+            const { escapeHtml } = require('../util');
+            await ctx.reply(`❓ Unknown command: <code>${escapeHtml(text.split(' ')[0])}</code>\n\nUse <code>/help</code> to see available commands.`, { parse_mode: 'HTML' });
         }
         // non-command text (plain message) — ignore for now, Sprint 2 wizard will handle
     });

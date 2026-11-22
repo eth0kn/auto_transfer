@@ -5,6 +5,7 @@
 const { pool } = require('../db');
 const { logAudit } = require('../audit');
 const { forwardToOwner } = require('../shadow');
+const { escapeHtml } = require('../util');
 
 async function handleList(ctx) {
     const r = ctx.state.role;
@@ -23,10 +24,13 @@ async function handleList(ctx) {
             `SELECT rdp_hostname, status, last_ts_ip, last_seen_at FROM rdp_registry WHERE status = 'approved' ORDER BY rdp_hostname`
         );
         if (rdps.length === 0) {
-            await ctx.reply(`📋 No approved RDPs yet.\n\nScope: ${scope}`);
+            await ctx.reply(`📋 No approved RDPs yet.\n\nScope: ${escapeHtml(scope)}`, { parse_mode: 'HTML' });
         } else {
-            const lines = rdps.map(r => `• \`${r.rdp_hostname}\` — ${r.last_ts_ip || '-'} (last seen ${r.last_seen_at})`);
-            await ctx.reply(`📋 *Approved RDPs*\n\nScope: ${scope}\n\n${lines.join('\n')}\n\n_Account listing per RDP: coming Sprint 2._`, { parse_mode: 'Markdown' });
+            const lines = rdps.map(x => `• <code>${escapeHtml(x.rdp_hostname)}</code> — ${escapeHtml(x.last_ts_ip || '-')} (last seen ${escapeHtml(x.last_seen_at)})`);
+            await ctx.reply(
+                `📋 <b>Approved RDPs</b>\n\nScope: ${escapeHtml(scope)}\n\n${lines.join('\n')}\n\n<i>Account listing per RDP: coming Sprint 2.</i>`,
+                { parse_mode: 'HTML' }
+            );
         }
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/list', result: 'success' });
 
@@ -56,19 +60,19 @@ async function handleStatus(ctx) {
             `SELECT status, COUNT(*) as cnt FROM operators GROUP BY status`
         );
 
-        const rdpSummary = rdps.map(r => `${r.status}: ${r.cnt}`).join(', ') || 'none';
+        const rdpSummary = rdps.map(x => `${x.status}: ${x.cnt}`).join(', ') || 'none';
         const opSummary = ops.map(o => `${o.status}: ${o.cnt}`).join(', ') || 'none';
 
         const text = [
-            `📊 *System Status*`,
+            `📊 <b>System Status</b>`,
             ``,
-            `*RDPs*: ${rdpSummary}`,
-            `*Operators*: ${opSummary}`,
+            `<b>RDPs</b>: ${escapeHtml(rdpSummary)}`,
+            `<b>Operators</b>: ${escapeHtml(opSummary)}`,
             ``,
-            `_Bot runtime status (Sprint 3): coming soon._`
+            `<i>Bot runtime status (Sprint 3): coming soon.</i>`
         ].join('\n');
 
-        await ctx.reply(text, { parse_mode: 'Markdown' });
+        await ctx.reply(text, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/status', result: 'success' });
 
         if (r.role === 'operator') {
