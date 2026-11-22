@@ -744,6 +744,16 @@ async function handleEditValueInput(ctx, active) {
             return true;
         }
     }
+
+    // v4.3.13 Sprint 3 polish: auto-delete sensitive input message from chat
+    // history (private chat only — bot has delete rights on user messages
+    // there, not in groups). Wrap in try/catch: non-blocking if message >48h
+    // old or Telegram API transient. Executes AFTER validation pass so operator
+    // doesn't lose their input accidentally on validation retry.
+    if (SENSITIVE_EDIT_FIELDS.has(active.data.field)) {
+        try { await ctx.deleteMessage(); } catch (_) { /* non-blocking */ }
+    }
+
     try {
         await advanceWizard(r.chat_id, 'confirm', { value });
     } catch (e) {
@@ -1006,6 +1016,15 @@ async function handleAddValueInput(ctx, active) {
         };
         await ctx.reply(`❌ ${msgs[check.error] || check.error}\n\nSend the value again or /cancel.`, { parse_mode: 'HTML' });
         return true;
+    }
+
+    // v4.3.13 Sprint 3 polish: auto-delete sensitive input (password, pair_code)
+    // from chat history for security. Executes AFTER validation pass so bad
+    // input doesn't get deleted (operator retry preserves what they typed).
+    // Non-blocking try/catch: Telegram allows bot to delete incoming messages
+    // in private chats but can fail silently if message >48h old / API transient.
+    if (SENSITIVE_ADD_FIELDS.has(stepKey)) {
+        try { await ctx.deleteMessage(); } catch (_) { /* non-blocking */ }
     }
 
     const next = nextAddStep(stepKey);
