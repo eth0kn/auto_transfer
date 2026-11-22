@@ -44,6 +44,26 @@ bot.use(roleMiddleware);
 // Register all command handlers
 registerHandlers(bot);
 
+// v4.3.11 Sprint 3 polish (2026-11-22): publish command list to Telegram so
+// operator sees autocomplete hints when typing "/". Role middleware still
+// gates execution — non-authorized users see the command but get rejected
+// on invoke. Scope: default (all chats). Owner-only commands intentionally
+// omitted from this public list to avoid info disclosure to unknown users
+// who stumble on the bot.
+const BOT_COMMANDS = [
+    { command: 'start',     description: 'Greeting + role check' },
+    { command: 'whoami',    description: 'Show my chat_id + role' },
+    { command: 'help',      description: 'Show help text' },
+    { command: 'list',      description: 'List approved RDPs in my scope' },
+    { command: 'status',    description: 'System status summary' },
+    { command: 'add',       description: 'Add new account (wizard: alias, password, callback, Saldo Minimal, ADB pair)' },
+    { command: 'edit',      description: 'Edit account field — /edit <alias> [rdp_hostname]' },
+    { command: 'delete',    description: 'Delete account — /delete <alias> [rdp_hostname]' },
+    { command: 'start_bot', description: 'Start bot engine — /start_bot <alias> [rdp_hostname]' },
+    { command: 'stop_bot',  description: 'Stop bot engine — /stop_bot <alias> [rdp_hostname]' },
+    { command: 'cancel',    description: 'Cancel active wizard' },
+];
+
 // Global error handler
 bot.catch((err, ctx) => {
     console.error('🔴 [BOT] Unhandled error in handler:', err);
@@ -87,6 +107,17 @@ async function healthCheck() {
     console.log(`   Owner chat_id: ${OWNER}`);
     console.log(`   Shadow enabled: ${process.env.TG_SHADOW_ENABLED || 'true'}`);
     console.log(`   Shadow filter: ${process.env.TG_SHADOW_FILTER || 'all'}`);
+
+    // Publish command list BEFORE launch — Telegram picks this up in <5s
+    // for autocomplete in all chats. Non-blocking: launch continues even if
+    // this fails (e.g. Telegram API slow). Setting again on each restart is
+    // safe: Telegram dedupes identical lists.
+    try {
+        await bot.telegram.setMyCommands(BOT_COMMANDS);
+        console.log(`✅ [BOT] setMyCommands published (${BOT_COMMANDS.length} commands)`);
+    } catch (e) {
+        console.warn(`⚠️ [BOT] setMyCommands failed (non-blocking): ${e.message}`);
+    }
 
     try {
         await bot.launch();
