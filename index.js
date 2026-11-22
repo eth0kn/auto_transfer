@@ -1381,6 +1381,68 @@ function setupBotNamespace(app_source) {
             // auto-pruned by next tick. emitToBot guard akan allow emit lagi.
             socket.disconnected_at = null;
 
+            // TG Bot Sprint 1 (2026-11-22): auto-register RDP ke rdp_registry.
+            // Model C Auto-Sync + Same-IP Relax (lihat docs/feature_telegram_bot_concept_2026-11-21.md §2).
+            // Post mini-scan G1 (2026-11-22): + security downgrade on diff IP (F1 + F6 race-safe).
+            // - First-time hostname: INSERT pending (owner approve via Telegram /approve-rdp)
+            // - Pending + sameIp (was bound before): auto-approve (Same-IP Relax)
+            // - Approved + sameIp: no change (just update last_ts_ip)
+            // - Approved + diff IP: SECURITY — downgrade to pending (prevent hostname spoofing)
+            // - Revoked: stays revoked (owner security decision, requires manual re-approve)
+            // Idempotent, non-blocking — error di sini tidak kill bot:register flow.
+            if (rdp_hostname) {
+                try {
+                    const [existing] = await pool.execute(
+                        'SELECT status, bound_ts_ip FROM rdp_registry WHERE rdp_hostname = ? LIMIT 1',
+                        [rdp_hostname]
+                    );
+                    if (existing.length === 0) {
+                        // F6 race-safe: INSERT ON DUPLICATE KEY — concurrent bot:register with same new hostname won't ER_DUP_ENTRY
+                        await pool.execute(
+                            `INSERT INTO rdp_registry (rdp_hostname, last_ts_ip, status) VALUES (?, ?, 'pending')
+                             ON DUPLICATE KEY UPDATE last_ts_ip = VALUES(last_ts_ip)`,
+                            [rdp_hostname, rdp_ts_ip]
+                        );
+                        console.log(`[TG] 🆕 New RDP registered pending: ${rdp_hostname} (${rdp_ts_ip})`);
+                    } else {
+                        const row = existing[0];
+                        const sameIp = row.bound_ts_ip && rdp_ts_ip && row.bound_ts_ip === rdp_ts_ip;
+
+                        if (row.status === 'pending' && sameIp) {
+                            // Same-IP Relax: previously bound, reconnect pending → auto-approve
+                            await pool.execute(
+                                `UPDATE rdp_registry SET status = 'approved', approved_by = 'auto-same-ip-relax', approved_at = NOW(), last_ts_ip = ? WHERE rdp_hostname = ?`,
+                                [rdp_ts_ip, rdp_hostname]
+                            );
+                            console.log(`[TG] 🔁 RDP auto-approved via Same-IP Relax: ${rdp_hostname}`);
+                        } else if (row.status === 'approved' && row.bound_ts_ip && rdp_ts_ip && !sameIp) {
+                            // F1 Security fix (mini-scan 2026-11-22): approved RDP connecting from different IP
+                            // = possible hostname spoofing. Downgrade to pending, require owner re-approve.
+                            await pool.execute(
+                                `UPDATE rdp_registry SET status = 'pending', last_ts_ip = ? WHERE rdp_hostname = ?`,
+                                [rdp_ts_ip, rdp_hostname]
+                            );
+                            console.warn(`[TG] ⚠️ RDP IP changed, security downgrade: ${rdp_hostname} (bound ${row.bound_ts_ip} → now ${rdp_ts_ip})`);
+                        } else {
+                            // Status approved+sameIp OR revoked (stays revoked) OR pending without bound_ts_ip
+                            // Just update last_ts_ip (last_seen_at auto via ON UPDATE CURRENT_TIMESTAMP)
+                            await pool.execute(
+                                'UPDATE rdp_registry SET last_ts_ip = ? WHERE rdp_hostname = ?',
+                                [rdp_ts_ip, rdp_hostname]
+                            );
+                        }
+                    }
+                } catch (e) {
+                    // Table missing (migration not applied) atau other DB error — log + continue.
+                    // Bot engine functionality tidak dipengaruhi.
+                    if (e.code === 'ER_NO_SUCH_TABLE') {
+                        console.warn(`[TG] rdp_registry table missing — skip (run migration)`);
+                    } else {
+                        console.error(`[TG] rdp_registry upsert error:`, e.message);
+                    }
+                }
+            }
+
             botSockets.set(key, socket);
 
             const regLabel = socket.passive_mirror ? 'PASSIVE MIRROR REGISTERED' : (isReRegister ? 'BOT RE-REGISTERED' : 'BOT REGISTERED');
