@@ -26,7 +26,7 @@ async function handleCancel(ctx) {
 }
 
 /**
- * Sprint 2a: router stub. Sprint 2c+ fills in step dispatcher.
+ * Sprint 2a: router stub. Sprint 2c: dispatch to /edit await_value step.
  * Returns true if the message was handled by a wizard step, false otherwise.
  */
 async function routeWizardText(ctx) {
@@ -39,9 +39,15 @@ async function routeWizardText(ctx) {
     const active = await getActiveWizard(r.chat_id);
     if (!active) return false;
 
-    // Sprint 2a scaffold — no step handlers yet
+    // Sprint 2c: /edit wizard await_value step
+    if (active.wizard_type === 'edit' && active.step === 'await_value') {
+        const { handleEditValueInput } = require('./operator');
+        return await handleEditValueInput(ctx, active);
+    }
+
+    // Unknown wizard/step — stub reply for future sprints
     await ctx.reply(
-        `⏳ Wizard <code>${escapeHtml(active.wizard_type)}</code> step <code>${escapeHtml(active.step)}</code> — handler not implemented yet (Sprint 2c+).\n\nUse <code>/cancel</code> to exit.`,
+        `⏳ Wizard <code>${escapeHtml(active.wizard_type)}</code> step <code>${escapeHtml(active.step)}</code> — handler not implemented yet.\n\nUse <code>/cancel</code> to exit.`,
         { parse_mode: 'HTML' }
     );
     return true;

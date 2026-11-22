@@ -63,18 +63,49 @@ async function getActiveWizard(chatId) {
 
 /**
  * Advance wizard to next step, merge new data fields.
+ *
+ * F2 Sprint 2c fix: atomic via single UPDATE with JSON_SET + JSON_MERGE_PATCH.
+ * InnoDB row-level lock serializes concurrent UPDATEs on same chat_id,
+ * so the merge never clobbers a concurrent peer's field write
+ * (e.g. two callback_queries arriving nearly simultaneously).
+ * Previous read-modify-write pattern had a lost-write race between SELECT and UPDATE.
+ *
+ * F1 Sprint 2c mini-scan fix: optional expectedCurrentStep gate.
+ * When provided, the UPDATE's WHERE clause also requires `JSON_EXTRACT($.step) = expectedCurrentStep`.
+ * This gives us an atomic compare-and-set used as a one-shot lock on destructive confirmations
+ * (double-click "✅ YES" won't fire the backend call twice; only the first caller gets affectedRows=1).
+ *
+ * @param {string|number} chatId
+ * @param {string} nextStep
+ * @param {object} [mergeData={}]
+ * @param {string|null} [expectedCurrentStep=null]  — if set, transition only applies when current step matches
+ * @throws {Error} 'no active wizard' when 0 rows affected (expired/absent/wrong-step)
  */
-async function advanceWizard(chatId, nextStep, mergeData = {}) {
-    const current = await getActiveWizard(chatId);
-    if (!current) throw new Error('no active wizard');
-    const newData = { ...current.data, ...mergeData };
-    const stateJson = JSON.stringify({ step: nextStep, data: newData });
+async function advanceWizard(chatId, nextStep, mergeData = {}, expectedCurrentStep = null) {
     const expiresAt = new Date(Date.now() + DEFAULT_TTL_MIN * 60 * 1000);
-    await pool.execute(
-        `UPDATE wizard_sessions SET state_json = ?, expires_at = ? WHERE chat_id = ?`,
-        [stateJson, expiresAt, chatId]
+    const mergeJson = JSON.stringify(mergeData || {});
+    const params = [nextStep, mergeJson, expiresAt, chatId];
+    let stepGuard = '';
+    if (expectedCurrentStep !== null) {
+        stepGuard = ` AND JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.step')) = ?`;
+        params.push(expectedCurrentStep);
+    }
+    const [result] = await pool.execute(
+        `UPDATE wizard_sessions
+         SET state_json = JSON_SET(
+                 COALESCE(state_json, JSON_OBJECT('step', NULL, 'data', JSON_OBJECT())),
+                 '$.step', ?,
+                 '$.data', JSON_MERGE_PATCH(
+                     COALESCE(JSON_EXTRACT(state_json, '$.data'), JSON_OBJECT()),
+                     CAST(? AS JSON)
+                 )
+             ),
+             expires_at = ?
+         WHERE chat_id = ? AND expires_at > NOW()${stepGuard}`,
+        params
     );
-    return { wizard_type: current.wizard_type, step: nextStep, data: newData };
+    if (!result.affectedRows) throw new Error('no active wizard');
+    return await getActiveWizard(chatId);
 }
 
 /**

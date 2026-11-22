@@ -101,6 +101,18 @@ router.get('/health', (req, res) => {
     res.json({ ok: true, ts: new Date().toISOString() });
 });
 
+// ==========================================================
+// Field whitelist for /edit — gate what's editable from bot
+// Sensitive fields (password, api_key) have their VALUE masked in audit.
+// ==========================================================
+const EDITABLE_FIELDS = new Set(['username', 'password', 'callback_url', 'api_key']);
+const SENSITIVE_FIELDS = new Set(['password', 'api_key']);
+
+function maskedArgs(alias, rdp, field, value) {
+    const v = SENSITIVE_FIELDS.has(field) ? '***' : (typeof value === 'string' ? value.slice(0, 40) : '?');
+    return `${alias}@${rdp}:${field}=${v}`;
+}
+
 // POST /api/tg/account/delete
 // Body: { alias, rdp_hostname, operator_chat_id }
 // Response Sprint 2b: 501 — clientapp support coming Sprint 2e
@@ -145,6 +157,67 @@ router.post('/account/delete', async (req, res) => {
         status: 'not_implemented_yet',
         detail: 'Backend auth + scope OK. Clientapp support coming Sprint 2e.',
         received: { alias, rdp_hostname, operator_chat_id },
+        scope: scopeCheck
+    });
+});
+
+// POST /api/tg/account/edit
+// Body: { alias, rdp_hostname, field, value, operator_chat_id }
+// Response Sprint 2c: 501 — clientapp support coming Sprint 2e
+router.post('/account/edit', async (req, res) => {
+    const { alias, rdp_hostname, field, value, operator_chat_id } = req.body || {};
+    if (!alias || !rdp_hostname || !field || value === undefined || value === null || !operator_chat_id) {
+        return res.status(400).json({
+            error: 'missing_fields',
+            detail: 'required: alias, rdp_hostname, field, value, operator_chat_id'
+        });
+    }
+
+    // Field whitelist — reject unknown
+    if (!EDITABLE_FIELDS.has(field)) {
+        try {
+            await pool.execute(
+                `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [String(operator_chat_id), 'unknown', '/edit', `${alias}@${rdp_hostname}:${field}`, 'rejected', 'field_not_editable']
+            );
+        } catch (_) { /* non-blocking */ }
+        return res.status(400).json({ error: 'field_not_editable', detail: `allowed: ${[...EDITABLE_FIELDS].join('|')}` });
+    }
+
+    // Length guard — value capped at 1024 chars (defense in depth)
+    if (typeof value !== 'string' || value.length > 1024) {
+        return res.status(400).json({ error: 'invalid_value', detail: 'value must be string ≤1024 chars' });
+    }
+
+    // Validate scope (same logic as /delete)
+    const scopeCheck = await validateOperatorScope(operator_chat_id, rdp_hostname);
+    if (!scopeCheck.ok) {
+        try {
+            await pool.execute(
+                `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [String(operator_chat_id), 'unknown', '/edit', maskedArgs(alias, rdp_hostname, field, value), 'denied', scopeCheck.error]
+            );
+        } catch (_) { /* non-blocking */ }
+        return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
+    }
+
+    // Audit the edit request (value masked for sensitive fields).
+    try {
+        await pool.execute(
+            `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [String(operator_chat_id), scopeCheck.role, '/edit', maskedArgs(alias, rdp_hostname, field, value), 'success', 'sprint2c_scaffold_queued']
+        );
+    } catch (e) {
+        console.error('[TG-IPC] audit insert failed:', e.message);
+    }
+
+    return res.status(501).json({
+        status: 'not_implemented_yet',
+        detail: 'Backend auth + scope + field whitelist OK. Clientapp support coming Sprint 2e.',
+        received: { alias, rdp_hostname, field, operator_chat_id },
         scope: scopeCheck
     });
 });

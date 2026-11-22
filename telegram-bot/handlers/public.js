@@ -92,9 +92,10 @@ async function handleHelp(ctx) {
             ``,
             `<b>Account CRUD</b>`,
             `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline Y/N confirm)`,
+            `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit field via wizard (username/password/callback_url/api_key)`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): /add /edit /start_bot /stop_bot</i>`
+            `<i>Sprint 2+ (coming): /add /start_bot /stop_bot</i>`
         ].join('\n');
     } else if (r.role === 'operator') {
         text = [
@@ -104,9 +105,10 @@ async function handleHelp(ctx) {
             `• <code>/list</code> — list your accessible accounts (coming Sprint 2)`,
             `• <code>/status</code> — RDP + bot health (coming Sprint 2)`,
             `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline confirm)`,
+            `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit account field via wizard`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): /add /edit /start_bot /stop_bot</i>`,
+            `<i>Sprint 2+ (coming): /add /start_bot /stop_bot</i>`,
             `<i>Contact owner if you need more access.</i>`
         ].join('\n');
     } else {
