@@ -90,27 +90,36 @@ async function handleHelp(ctx) {
             `• <code>/shadow on|off|filter &lt;level&gt;</code> — control shadow forward`,
             `• <code>/audit [chat_id] [limit]</code> — view audit log`,
             ``,
-            `<b>Account CRUD</b>`,
-            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url → device IP → pair code)`,
-            `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit field via wizard (alias/password/callback_url/device_id/remote_ip)`,
-            `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline Y/N confirm)`,
+            `<b>Account CRUD</b> <i>(rdp_hostname optional — fan-out resolver auto-finds; multi-hit shows picker)</i>`,
+            `• <code>/add</code> — create account via wizard (RDP → alias → password → callback → Saldo Minimal → device IP → pair code)`,
+            `• <code>/edit &lt;alias&gt; [rdp_hostname]</code> — edit field via wizard (alias/password/callback_url/device_id/keep_balance)`,
+            `• <code>/delete &lt;alias&gt; [rdp_hostname]</code> — delete account (inline Y/N confirm)`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): /start_bot /stop_bot</i>`
+            `<b>Runtime Control</b> (Sprint 3)`,
+            `• <code>/start_bot &lt;alias&gt; [rdp_hostname]</code> — start bot engine for account`,
+            `• <code>/stop_bot &lt;alias&gt; [rdp_hostname]</code> — stop bot engine`,
+            ``,
+            `<i>Policy: alias unik lintas RDP adalah konvensi operator (naming), bukan code-enforced. Kalau alias ambiguous → bot kasih picker inline.</i>`
         ].join('\n');
     } else if (r.role === 'operator') {
         text = [
             `👤 <b>Operator Commands</b>`,
             ``,
             `• <code>/whoami</code> — your role info`,
-            `• <code>/list</code> — list your accessible accounts (coming Sprint 2)`,
-            `• <code>/status</code> — RDP + bot health (coming Sprint 2)`,
-            `• <code>/add</code> — create account via wizard (pick RDP → alias → password → callback_url → device IP → pair code)`,
-            `• <code>/edit &lt;alias&gt; &lt;rdp_hostname&gt;</code> — edit account field via wizard`,
-            `• <code>/delete &lt;alias&gt; &lt;rdp_hostname&gt;</code> — delete account (inline confirm)`,
+            `• <code>/list</code> — list your accessible RDPs`,
+            `• <code>/status</code> — RDP + bot health summary`,
+            ``,
+            `<b>Account CRUD</b> <i>(rdp_hostname optional — fan-out resolver auto-finds)</i>`,
+            `• <code>/add</code> — create account via wizard`,
+            `• <code>/edit &lt;alias&gt; [rdp_hostname]</code> — edit field via wizard`,
+            `• <code>/delete &lt;alias&gt; [rdp_hostname]</code> — delete account (inline confirm)`,
             `• <code>/cancel</code> — abort active wizard`,
             ``,
-            `<i>Sprint 2+ (coming): /start_bot /stop_bot</i>`,
+            `<b>Runtime Control</b>`,
+            `• <code>/start_bot &lt;alias&gt; [rdp_hostname]</code> — start bot engine`,
+            `• <code>/stop_bot &lt;alias&gt; [rdp_hostname]</code> — stop bot engine`,
+            ``,
             `<i>Contact owner if you need more access.</i>`
         ].join('\n');
     } else {
