@@ -1550,9 +1550,14 @@ function setupBotNamespace(app_source) {
         });
 
         // Sprint 2e (v4.3.8): control-plane socket registration from clientapp main.js.
-        // Distinct from bot:register — no engine semantics, no rdp_registry upsert
-        // (that's bot:register's job). Just stashes socket for tg:account_* round-trips.
-        socket.on('rdp:control_register', (payload) => {
+        // Distinct from bot:register — no engine semantics, no bot socket wiring.
+        // Just stashes socket for tg:account_* round-trips.
+        // v4.5.1 fix (2026-11-23): also auto-upsert pending row to rdp_registry.
+        //   Enables owner-first workflow (/approve_rdp BEFORE pairing any accounts).
+        //   No-op if RDP already in registry (preserves status via ON DUPLICATE KEY).
+        //   Mirrors bot:register upsert pattern tanpa rdp_ts_ip (control socket
+        //   payload hanya carry rdp_hostname).
+        socket.on('rdp:control_register', async (payload) => {
             const { rdp_hostname } = payload || {};
             if (!rdp_hostname) {
                 console.log(`❌ [${app_source}] rdp:control_register missing rdp_hostname`);
@@ -1571,6 +1576,23 @@ function setupBotNamespace(app_source) {
             socket.control_rdp_hostname = rdp_hostname;
             rdpControlSockets.set(key, socket);
             console.log(`🎛️ [${app_source}] CONTROL-PLANE REGISTERED: ${rdp_hostname} (socket ${socket.id})`);
+
+            // v4.5.1 fix: upsert pending row (idempotent) — see comment block above.
+            try {
+                await pool.execute(
+                    `INSERT INTO rdp_registry (rdp_hostname, status) VALUES (?, 'pending')
+                     ON DUPLICATE KEY UPDATE rdp_hostname = rdp_hostname`,
+                    [rdp_hostname]
+                );
+                console.log(`[TG] 🆕 Control-plane upsert rdp_registry: ${rdp_hostname} (pending if new, unchanged if existing)`);
+            } catch (e) {
+                if (e.code === 'ER_NO_SUCH_TABLE') {
+                    console.warn(`[TG] rdp_registry table missing — skip (run migration)`);
+                } else {
+                    console.error(`[TG] rdp:control_register upsert error:`, e.message);
+                }
+            }
+
             socket.emit('rdp:control_registered', { ok: true, rdp_hostname });
         });
 
