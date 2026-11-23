@@ -278,10 +278,14 @@ router.get('/health', (req, res) => {
 // NO username / api_key columns exist. Login BRImo pakai password saja.
 // v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped (auto-derived at clientapp
 // via CGNAT regex, mirroring UI readonly behavior); keep_balance added (numeric
-// "Sisakan Saldo Minimal (Rp)"). Deferred: mutasi_enabled, mirror_enabled.
-// Editable: alias | password | callback_url | device_id | keep_balance (5 fields).
+// "Sisakan Saldo Minimal (Rp)").
+// v4.3.17 / Sprint 3 polish (2026-11-23): mutasi_enabled added (Cek Mutasi ON/OFF
+// toggle, parity dgn Electron dashboard modal checkbox). mirror_enabled DEFERRED
+// — toggle di card langsung via handleMirrorToggle (bukan modal), semantic lebih
+// kompleks (passive socket lifecycle via applyMirrorToggle).
+// Editable: alias | password | callback_url | device_id | keep_balance | mutasi_enabled (6 fields).
 // ==========================================================
-const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'keep_balance']);
+const EDITABLE_FIELDS = new Set(['alias', 'password', 'callback_url', 'device_id', 'keep_balance', 'mutasi_enabled']);
 const SENSITIVE_FIELDS = new Set(['password']);
 const ALIAS_REGEX        = /^[^\x00-\x1F\x7F]{1,128}$/;
 const URL_REGEX          = /^https?:\/\/.+/i;
@@ -309,6 +313,22 @@ function coerceKeepBalance(v) {
         if (n >= 0 && n <= KEEP_BALANCE_MAX) return { ok: true, value: n };
     }
     return { ok: false, error: 'invalid_keep_balance' };
+}
+
+/**
+ * Sprint 3 polish (v4.3.17): mutasi_enabled coerce.
+ * Accepts: boolean | integer 0/1 | string '0'/'1'/'on'/'off'/'true'/'false' (case-insensitive).
+ * Returns integer 0 or 1 for forwarding to clientapp.
+ */
+function coerceMutasiEnabled(v) {
+    if (v === true || v === 1) return { ok: true, value: 1 };
+    if (v === false || v === 0) return { ok: true, value: 0 };
+    if (typeof v === 'string') {
+        const s = v.trim().toLowerCase();
+        if (s === '1' || s === 'on' || s === 'true' || s === 'yes') return { ok: true, value: 1 };
+        if (s === '0' || s === 'off' || s === 'false' || s === 'no') return { ok: true, value: 0 };
+    }
+    return { ok: false, error: 'invalid_mutasi_enabled' };
 }
 
 function maskedArgs(alias, rdp, field, value) {
@@ -497,6 +517,10 @@ router.post('/account/edit', async (req, res) => {
         const kb = coerceKeepBalance(value);
         if (!kb.ok) return res.status(400).json({ error: 'invalid_keep_balance', detail: `non-negative integer, 0 to ${KEEP_BALANCE_MAX}` });
         forwardedValue = kb.value;
+    } else if (field === 'mutasi_enabled') {
+        const m = coerceMutasiEnabled(value);
+        if (!m.ok) return res.status(400).json({ error: 'invalid_mutasi_enabled', detail: 'accept: 0|1|on|off|true|false' });
+        forwardedValue = m.value;
     } else if (value.length > 1024) {
         return res.status(400).json({ error: 'invalid_value', detail: 'value must be ≤1024 chars' });
     }

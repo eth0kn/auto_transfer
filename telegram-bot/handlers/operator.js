@@ -77,17 +77,25 @@ async function resolveAliasOrPicker(ctx, action, alias, extraContext = {}) {
 // v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped from whitelist — auto-derived
 // from device_id via CGNAT regex at clientapp side (mirror UI readonly behavior).
 // keep_balance added — numeric "Sisakan Saldo Minimal (Rp)" matches clientapp modal.
-// Field whitelist: alias | password | callback_url | device_id | keep_balance (5 fields).
+// v4.3.17 / Sprint 3 polish (2026-11-23): mutasi_enabled added — ON/OFF inline
+// picker, parity dgn dashboard modal checkbox inp-mutasi-enabled.
+// Field whitelist: alias | password | callback_url | device_id | keep_balance | mutasi_enabled (6 fields).
 const EDIT_FIELDS = [
-    { key: 'alias',        label: 'Alias' },
-    { key: 'password',     label: 'Password' },
-    { key: 'callback_url', label: 'Callback URL' },
-    { key: 'device_id',    label: 'Device ID' },
-    { key: 'keep_balance', label: 'Saldo Minimal (Rp)' },
+    { key: 'alias',          label: 'Alias' },
+    { key: 'password',       label: 'Password' },
+    { key: 'callback_url',   label: 'Callback URL' },
+    { key: 'device_id',      label: 'Device ID' },
+    { key: 'keep_balance',   label: 'Saldo Minimal (Rp)' },
+    { key: 'mutasi_enabled', label: 'Cek Mutasi (ON/OFF)' },
 ];
 const SENSITIVE_EDIT_FIELDS = new Set(['password']);
 function maskForDisplay(field, value) {
     if (SENSITIVE_EDIT_FIELDS.has(field)) return '••••••••';
+    // v4.3.17 Sprint 3 polish: mutasi_enabled stored as '1'/'0' string in wizard
+    // (set by handleEditMutasiPick), render as human-readable state for confirm page.
+    if (field === 'mutasi_enabled') {
+        return value === '1' || value === 1 || value === true ? '🟢 ON' : '⚫ OFF';
+    }
     if (typeof value !== 'string') return '-';
     return value.length > 60 ? value.slice(0, 57) + '...' : value;
 }
@@ -521,6 +529,11 @@ async function handleEditFieldPick(ctx) {
     if (fieldKey === 'device_id') {
         return handleEditFieldDeviceIdPick(ctx, active, fieldDef);
     }
+    // Sprint 3 polish (v4.3.17): mutasi_enabled gets ON/OFF inline keyboard
+    // picker — mirror dashboard modal checkbox UX. Zero typo risk + explicit state.
+    if (fieldKey === 'mutasi_enabled') {
+        return handleEditFieldMutasiPick(ctx, active, fieldDef);
+    }
 
     try {
         await advanceWizard(r.chat_id, 'await_value', { field: fieldKey });
@@ -703,6 +716,92 @@ async function handleEditDeviceManual(ctx) {
     } catch (_) {}
     await ctx.answerCbQuery('Manual entry');
     await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:device_manual', args: `${active.data.alias}@${active.data.rdp_hostname}`, result: 'success' });
+}
+
+/**
+ * Sprint 3 polish (v4.3.17): mutasi_enabled ON/OFF inline picker.
+ * Mirror pattern device_id dropdown — explicit state buttons replace free
+ * text input. Clientapp DB stores integer 0/1; wizard state carries '1'/'0'
+ * string so confirm page can escape + render via maskForDisplay.
+ */
+async function handleEditFieldMutasiPick(ctx, active, fieldDef) {
+    const r = ctx.state.role;
+    try {
+        await advanceWizard(r.chat_id, 'await_mutasi_pick', { field: 'mutasi_enabled' });
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    try {
+        await ctx.editMessageText(
+            `✏️ <b>Edit account</b>\n\n` +
+            `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+            `RDP: <code>${escapeHtml(active.data.rdp_hostname)}</code>\n` +
+            `Field: <b>${escapeHtml(fieldDef.label)}</b>\n\n` +
+            `Pilih state baru:\n` +
+            `<i>🟢 ON: bot scan tab Mutasi + upload ke webhook tiap cycle.\n` +
+            `⚫ OFF: bot skip tab Mutasi (sleep 5s + balik ke Dashboard). Balance tetap scan.</i>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🟢 ON', callback_data: 'edit_mutasi:on' },
+                            { text: '⚫ OFF', callback_data: 'edit_mutasi:off' }
+                        ],
+                        [{ text: '❌ Cancel', callback_data: 'edit_cancel' }]
+                    ]
+                }
+            }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery(`Field: ${fieldDef.label}`);
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:pick_field', args: `${active.data.alias}@${active.data.rdp_hostname}:mutasi_enabled`, result: 'success' });
+}
+
+/**
+ * Sprint 3 polish (v4.3.17): mutasi_enabled picker click handler.
+ * Resolves on/off → '1'/'0' value → advance to confirm.
+ */
+async function handleEditMutasiPick(ctx) {
+    const r = ctx.state.role;
+    const pick = ctx.match[1]; // 'on' | 'off'
+    const active = await getActiveWizard(r.chat_id);
+    if (!active || active.wizard_type !== 'edit' || active.step !== 'await_mutasi_pick') {
+        await ctx.answerCbQuery('⏱ Session expired. Start again with /edit.', { show_alert: true });
+        try { await ctx.editMessageText('⏱ <i>Wizard expired or already handled.</i>', { parse_mode: 'HTML' }); } catch (_) {}
+        return;
+    }
+    const value = pick === 'on' ? '1' : '0';
+    try {
+        await advanceWizard(r.chat_id, 'confirm', { value }, 'await_mutasi_pick');
+    } catch (_) {
+        await ctx.answerCbQuery('⏱ Session expired.', { show_alert: true });
+        return;
+    }
+    const fieldDef = EDIT_FIELDS.find(f => f.key === 'mutasi_enabled');
+    const displayValue = maskForDisplay('mutasi_enabled', value);
+    try {
+        await ctx.editMessageText(
+            `⚠️ <b>Confirm edit</b>\n\n` +
+            `Account: <code>${escapeHtml(active.data.alias)}</code>\n` +
+            `RDP: <code>${escapeHtml(active.data.rdp_hostname)}</code>\n` +
+            `Field: <b>${escapeHtml(fieldDef?.label || 'Cek Mutasi')}</b>\n` +
+            `New value: <code>${escapeHtml(displayValue)}</code>\n\n` +
+            `<i>Engine akan live-read toggle di next cycle (zero restart). Dashboard auto-refresh via push.</i>`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ YES, apply', callback_data: 'edit_confirm:ok' },
+                        { text: '❌ Cancel', callback_data: 'edit_confirm:no' }
+                    ]]
+                }
+            }
+        );
+    } catch (_) {}
+    await ctx.answerCbQuery(`Mutasi: ${pick.toUpperCase()}`);
+    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit:mutasi_pick', args: `${active.data.alias}@${active.data.rdp_hostname}:${value}`, result: 'success' });
 }
 
 /**
@@ -1476,6 +1575,7 @@ module.exports = {
     handleDelete, handleDeleteConfirm, handleDeleteCancel,
     handleEdit, handleEditFieldPick, handleEditValueInput, handleEditConfirm, handleEditCancelAction,
     handleEditDevicePick, handleEditDeviceManual,
+    handleEditMutasiPick,
     handleAdd, handleAddRdpPick, handleAddValueInput, handleAddConfirm, handleAddCancelAction,
     handleStart, handleStop, handlePickRdp,
     handleListAccounts

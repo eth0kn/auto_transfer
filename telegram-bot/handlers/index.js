@@ -40,9 +40,11 @@ function registerHandlers(bot) {
     // keep_balance added (numeric "Saldo Minimal"). device_id picker uses edit_dev:<idx>
     // from a per-wizard cached device list (max 20) — index-based so callback_data
     // stays tiny regardless of serial length.
-    bot.action(/^edit_field:(alias|password|callback_url|device_id|keep_balance)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
+    bot.action(/^edit_field:(alias|password|callback_url|device_id|keep_balance|mutasi_enabled)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
     bot.action(/^edit_dev:(\d{1,2})$/, requireRole(['owner', 'operator']), op.handleEditDevicePick);
     bot.action(/^edit_dev_manual$/, requireRole(['owner', 'operator']), op.handleEditDeviceManual);
+    // Sprint 3 polish (v4.3.17): mutasi_enabled picker — ON/OFF static buttons
+    bot.action(/^edit_mutasi:(on|off)$/, requireRole(['owner', 'operator']), op.handleEditMutasiPick);
     bot.action(/^edit_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleEditConfirm);
     bot.action(/^edit_cancel$/, requireRole(['owner', 'operator']), op.handleEditCancelAction);
 
