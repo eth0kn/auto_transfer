@@ -113,7 +113,7 @@ function maskForDisplay(field, value) {
 // field "Sisakan Saldo Minimal (Rp)". Integer ≥0. Accept `0` for no threshold.
 const ADD_STEPS = [
     { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (free text, space allowed, ≤128 chars). Example: <code>Toko A 123</code>' },
-    { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> for BRImo login.\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
+    { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> untuk login banking app (BRImo / myBCA / SeaBank).\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
     { key: 'callback_url', label: 'Callback URL', prompt: 'Send the <b>callback URL</b> (http:// or https://):' },
     { key: 'keep_balance', label: 'Saldo Minimal',prompt: 'Send the <b>minimum balance to keep</b> (Rp, integer ≥0). Send <code>0</code> for no threshold.\n\n<i>Auto-transfer refuses to run if balance would fall below this amount.</i>' },
     { key: 'device_ip',    label: 'Device IP',    prompt: 'Send the <b>pair IP:port</b> shown on HP → Settings → Developer → Wireless debugging → <i>Pair device with pairing code</i>.\n\nFormat: <code>IP:PORT</code> (example <code>100.64.0.11:40123</code>). Port changes each time — use the pairing port, not the regular ADB port.' },
@@ -269,8 +269,8 @@ async function handleDelete(ctx) {
         await ctx.reply(
             'Usage: <code>/delete &lt;alias&gt; [rdp_hostname]</code>\n\n' +
             'Examples:\n' +
-            '• <code>/delete fajar-brimo-01</code> — auto-resolve RDP\n' +
-            '• <code>/delete fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing',
+            '• <code>/delete fajar-01</code> — auto-resolve RDP\n' +
+            '• <code>/delete fajar-01 RDP-01</code> — explicit routing',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', result: 'rejected', error_message: 'missing_args' });
@@ -447,8 +447,8 @@ async function handleEdit(ctx) {
         await ctx.reply(
             'Usage: <code>/edit &lt;alias&gt; [rdp_hostname]</code>\n\n' +
             'Examples:\n' +
-            '• <code>/edit fajar-brimo-01</code> — auto-resolve RDP\n' +
-            '• <code>/edit fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing',
+            '• <code>/edit fajar-01</code> — auto-resolve RDP\n' +
+            '• <code>/edit fajar-01 RDP-01</code> — explicit routing',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit', result: 'rejected', error_message: 'missing_args' });
@@ -1283,8 +1283,8 @@ async function handleStartStop(ctx, action) {
         await ctx.reply(
             `Usage: <code>/${action} &lt;alias&gt; [rdp_hostname]</code>\n\n` +
             'Examples:\n' +
-            `• <code>/${action} fajar-brimo-01</code> — auto-resolve RDP\n` +
-            `• <code>/${action} fajar-brimo-01 RDP-TF-BRImo1</code> — explicit routing`,
+            `• <code>/${action} fajar-01</code> — auto-resolve RDP\n` +
+            `• <code>/${action} fajar-01 RDP-01</code> — explicit routing`,
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${action}`, result: 'rejected', error_message: 'missing_args' });

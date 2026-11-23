@@ -21,6 +21,33 @@ let emitFn = null;
 function setEmitter(fn) { emitFn = fn; }
 const pendingTgRequests = new Map(); // request_id → {resolve, reject, timer}
 const DEFAULT_ROUNDTRIP_MS = parseInt(process.env.TG_ROUNDTRIP_MS || '30000', 10);
+
+// v4.3.18 Sprint 2g (2026-11-23): dynamic app_source resolver.
+// Sprint 2e scope hardcoded app_source='brimo'. Sprint 2f ported stack ke mybca
+// (dan seabank defer). Backend sekarang multi-clientapp aware — satu RDP bisa
+// run brimo OR mybca OR seabank (future) di waktu berbeda (atau multi simultaneously
+// walau ini uncommon). Reference ke rdpControlSockets Map (keyed `${app_source}:
+// ${rdp_hostname}`) di-inject dari index.js via setControlSocketMap.
+let rdpControlSocketsRef = null;
+function setControlSocketMap(map) { rdpControlSocketsRef = map; }
+
+/**
+ * Scan rdpControlSockets untuk cari ALL active app_sources di hostname tsb.
+ * Returns array (0 = no active clientapp, 1 = typical, >1 = multi-app at same RDP rare case).
+ * Cleanup path di index.js disconnect handler sudah .delete() dari Map → presence = active.
+ */
+function getActiveAppSourcesFor(rdp_hostname) {
+    if (!rdpControlSocketsRef) return [];
+    const sources = [];
+    for (const key of rdpControlSocketsRef.keys()) {
+        const sep = key.indexOf(':');
+        if (sep < 0) continue;
+        if (key.slice(sep + 1) === rdp_hostname) {
+            sources.push(key.slice(0, sep));
+        }
+    }
+    return sources;
+}
 function resolveAck(payload) {
     if (!payload?.request_id) return;
     const pending = pendingTgRequests.get(payload.request_id);
@@ -158,10 +185,26 @@ async function fanoutListAccounts(operatorChatId, opts = {}) {
 /**
  * Send event to the target RDP's control socket, await ack with timeout.
  * Returns: { ok: true, result } on success, { ok: false, error, detail, status } on failure.
- * app_source defaults to 'brimo' for Sprint 2e scope — Sprint 2f expands to mybca/seabank.
+ *
+ * v4.3.18 Sprint 2g (2026-11-23): dynamic app_source resolution.
+ *   - If opts.app_source explicit → use it (preserve explicit callers).
+ *   - Else → scan rdpControlSockets for active clientapp at this RDP. 1 hit =
+ *     auto-pick. 0 hit = rdp_offline error. >1 hit = pick first + log warning
+ *     (multi-clientapp at same RDP uncommon in current ops; future fan-out
+ *     enhancement if needed).
  */
 async function callClientapp(rdp_hostname, event, payload, opts = {}) {
-    const app_source = opts.app_source || 'brimo';
+    let app_source = opts.app_source;
+    if (!app_source) {
+        const active = getActiveAppSourcesFor(rdp_hostname);
+        if (active.length === 0) {
+            return { ok: false, error: 'rdp_offline', detail: `no active clientapp socket at ${rdp_hostname}`, status: 502 };
+        }
+        if (active.length > 1) {
+            console.warn(`[TG-IPC] ${rdp_hostname} has multiple active app_sources: ${active.join(', ')} — picking first (${active[0]})`);
+        }
+        app_source = active[0];
+    }
     const timeout_ms = opts.timeout_ms || DEFAULT_ROUNDTRIP_MS;
     if (!emitFn) return { ok: false, error: 'emit_not_wired', status: 500 };
     const request_id = crypto.randomUUID();
@@ -696,4 +739,4 @@ router.get('/accounts/list', async (req, res) => {
     return res.json({ ok: true, ...result });
 });
 
-module.exports = { router, setDb, setEmitter, resolveAck };
+module.exports = { router, setDb, setEmitter, setControlSocketMap, resolveAck };

@@ -1047,8 +1047,12 @@ app.get('/api/bots', requireAuth, (req, res) => {
 // v4.3.2 Sprint 2b (2026-11-22): Telegram Bot IPC — loopback + Bearer auth
 // Module at ./telegram-bot-ipc.js; mounted here only to share app + pool.
 // Sprint 2e (v4.3.8): inject control-socket emitter so IPC routes can round-trip.
+// Sprint 2g (v4.3.18, 2026-11-23): also inject rdpControlSockets Map reference
+// for dynamic app_source resolver — `callClientapp` without explicit app_source
+// now auto-picks active clientapp at given RDP.
 const tgIpc = require('./telegram-bot-ipc');
 tgIpc.setDb(pool);
+tgIpc.setControlSocketMap(rdpControlSockets);
 tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
     const key = `${app_source}:${rdp_hostname}`;
     const sock = rdpControlSockets.get(key);
