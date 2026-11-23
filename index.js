@@ -1450,6 +1450,20 @@ function setupBotNamespace(app_source) {
                                 [rdp_ts_ip, rdp_hostname]
                             );
                             console.warn(`[TG] ⚠️ RDP IP changed, security downgrade: ${rdp_hostname} (bound ${row.bound_ts_ip} → now ${rdp_ts_ip})`);
+                        } else if (row.status === 'approved' && !row.bound_ts_ip && rdp_ts_ip) {
+                            // v4.5.1 fix (2026-11-23): owner-first approve backfill bound_ts_ip.
+                            // If owner approves RDP via /approve_rdp BEFORE any account paired
+                            // (owner-first workflow enabled by v4.5.1 rdp:control_register upsert),
+                            // bound_ts_ip stays NULL — rdp:control_register payload only carries
+                            // rdp_hostname, not rdp_ts_ip. First bot:register post-approve carries
+                            // rdp_ts_ip in handshake payload → backfill here so /list_rdp shows IP
+                            // + Same-IP Relax engages on future reconnects + F1 security downgrade
+                            // works on IP change.
+                            await pool.execute(
+                                `UPDATE rdp_registry SET bound_ts_ip = ?, last_ts_ip = ? WHERE rdp_hostname = ?`,
+                                [rdp_ts_ip, rdp_ts_ip, rdp_hostname]
+                            );
+                            console.log(`[TG] 🔗 RDP owner-first backfill bound_ts_ip: ${rdp_hostname} = ${rdp_ts_ip}`);
                         } else {
                             // Status approved+sameIp OR revoked (stays revoked) OR pending without bound_ts_ip
                             // Just update last_ts_ip (last_seen_at auto via ON UPDATE CURRENT_TIMESTAMP)
