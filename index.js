@@ -1069,6 +1069,54 @@ tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
 });
 app.use('/api/tg', tgIpc.router);
 
+// ==========================================================
+// Dashboard Remote Control (Phase 1 v4.6.0)
+// ==========================================================
+// Cookie-auth proxy ke in-process tgIpc.fanoutListAccounts + tgIpc.botControl.
+// Dashboard admin = owner-scope — synthesize operator_chat_id = OWNER_CHAT_ID
+// (dashboard login sudah authenticate multi-user via bcrypt; mapping ke owner
+// scope via env). Reuse TG audit log path — entries tag `role: 'dashboard'`.
+const DASHBOARD_AUDIT_ROLE = 'dashboard';
+
+app.get('/api/dashboard/accounts', requireAuth, async (req, res) => {
+    const operator_chat_id = process.env.OWNER_CHAT_ID;
+    if (!operator_chat_id) {
+        return res.status(503).json({ error: 'owner_chat_id_unset', detail: 'OWNER_CHAT_ID must be set in .env' });
+    }
+    try {
+        const result = await tgIpc.fanoutListAccounts(operator_chat_id);
+        return res.json({ ok: true, ...result });
+    } catch (e) {
+        console.error('[dashboard /accounts]', e.message);
+        return res.status(500).json({ error: 'internal_error', detail: e.message });
+    }
+});
+
+app.post('/api/dashboard/bot/:action', requireAuth, async (req, res) => {
+    const action = req.params.action;
+    if (action !== 'start' && action !== 'stop') {
+        return res.status(400).json({ error: 'bad_action', detail: 'action must be start|stop' });
+    }
+    const operator_chat_id = process.env.OWNER_CHAT_ID;
+    if (!operator_chat_id) {
+        return res.status(503).json({ error: 'owner_chat_id_unset' });
+    }
+    const { alias, rdp_hostname } = req.body || {};
+    try {
+        const result = await tgIpc.botControl({
+            alias,
+            rdp_hostname,
+            operator_chat_id,
+            action,
+            audit_role: DASHBOARD_AUDIT_ROLE,
+        });
+        return res.status(result.status).json(result.data);
+    } catch (e) {
+        console.error(`[dashboard /bot/${action}]`, e.message);
+        return res.status(500).json({ error: 'internal_error', detail: e.message });
+    }
+});
+
 // GET /api/mirror/devices — device registry untuk mirror-proxy hub.
 // Dual auth: cookie isLoggedIn (browser) OR X-Admin-Key header
 // (mirror-proxy machine-to-machine).
@@ -2410,6 +2458,30 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   .bot-bank.mybca { color: var(--mybca-strong); background: var(--mybca-bg); }
   .bot-bank.seabank { color: var(--seabank-strong); background: var(--seabank-bg); }
 
+  /* Running/Stopped tab switcher + per-card action button (Phase 1 v4.6.0) */
+  .bot-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .bot-tab {
+    flex: 1; padding: 6px 8px; font-size: 11px; font-weight: 600;
+    background: transparent; color: var(--fg-muted);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    cursor: pointer; transition: all 0.12s; font-family: inherit;
+  }
+  .bot-tab:hover { background: var(--bg-input); color: var(--fg); }
+  .bot-tab.active { background: var(--bg-input); color: var(--fg); border-color: var(--fg-muted); }
+  .bot-tab .mono { margin-left: 4px; opacity: 0.7; font-size: 10px; }
+  .bot-item-row { display: grid; grid-template-columns: 8px 1fr auto; gap: 10px; align-items: center; padding: 9px 10px; border-radius: var(--radius-sm); transition: background 0.12s; }
+  .bot-item-row:hover { background: var(--bg-input); }
+  .bot-action-btn {
+    font-size: 10px; padding: 4px 10px; border-radius: 4px; font-weight: 700;
+    cursor: pointer; border: 1px solid transparent; white-space: nowrap;
+    font-family: inherit; letter-spacing: 0.02em;
+  }
+  .bot-action-btn.start { background: var(--success-bg, #d1fae5); color: var(--success-strong, #065f46); }
+  .bot-action-btn.start:hover { background: var(--success-strong, #065f46); color: #fff; }
+  .bot-action-btn.stop { background: var(--danger-bg, #fee2e2); color: var(--danger-strong, #991b1b); }
+  .bot-action-btn.stop:hover { background: var(--danger-strong, #991b1b); color: #fff; }
+  .bot-action-btn:disabled { opacity: 0.6; cursor: wait; }
+
   .sidebar-footer {
     margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 10px;
@@ -2793,7 +2865,11 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
 
     <div class="sidebar-section-label">
       <span>Bot Fleet</span>
-      <span id="bot-online-count" class="mono">0 online</span>
+      <span id="bot-online-count" class="mono">—</span>
+    </div>
+    <div class="bot-tabs">
+      <button class="bot-tab active" data-tab="running" onclick="switchBotTab('running')">Running <span id="tab-running-count" class="mono">0</span></button>
+      <button class="bot-tab" data-tab="stopped" onclick="switchBotTab('stopped')">Stopped <span id="tab-stopped-count" class="mono">0</span></button>
     </div>
     <div class="bot-list" id="bot-list">
       <div class="empty" style="padding: 12px 6px; font-size: 12px;">Memuat…</div>
@@ -3308,33 +3384,142 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     historyDebounce = setTimeout(loadHistory, 200);
   }
 
-  // ------- Load bots -------
-  async function loadBots() {
+  // ------- Load accounts (Phase 1 v4.6.0: tabs Running + Stopped) -------
+  // Replaces old loadBots() which showed online bots only. Fetches
+  // /api/dashboard/accounts (fan-outs to all RDPs, returns both running
+  // + stopped) and renders tabbed sidebar with Start/Stop button per card.
+  let currentBotTab = 'running';
+  let botAccounts = { running: [], stopped: [] };
+
+  async function loadAccounts() {
     try {
-      const res = await fetch('/api/bots');
-      const bots = await res.json();
-      const list = el('bot-list');
-      if (!bots.length) {
-        list.innerHTML = '<div class="empty" style="padding: 12px 6px; font-size: 12px;">Belum ada bot online</div>';
-      } else {
-        list.innerHTML = bots.map(b => \`
-          <div class="bot-item" data-alias="\${b.alias}" data-bank="\${b.app_source}">
-            <div class="bot-dot \${b.online ? 'online' : 'offline'}"></div>
-            <div class="bot-meta">
-              <div class="bot-name">\${b.alias}</div>
-              <div class="bot-info">\${b.device_id || '—'}</div>
-            </div>
-            <span class="bot-bank \${b.app_source}">\${bankShort(b.app_source)}</span>
-          </div>
-        \`).join('');
+      const res = await fetch('/api/dashboard/accounts');
+      const payload = await res.json();
+      if (!payload.ok) throw new Error(payload.error || payload.detail || 'load_failed');
+      const running = [];
+      const stopped = [];
+      for (const group of (payload.groups || [])) {
+        // group status: 'ok' | 'offline' | 'error' — only accounts from 'ok' RDPs listed
+        if (group.status !== 'ok' || !Array.isArray(group.accounts)) continue;
+        for (const acc of group.accounts) {
+          const row = {
+            alias: acc.alias,
+            rdp_hostname: group.rdp_hostname,
+            app_source: group.app_source || null,
+            device_id: acc.device_id,
+            bot_state: acc.bot_state,
+            mirror_enabled: acc.mirror_enabled,
+          };
+          if (acc.bot_state === 'running') running.push(row);
+          else stopped.push(row);
+        }
       }
-      el('bot-online-count').textContent = \`\${bots.length} online\`;
-    } catch (e) { console.error('loadBots', e); }
+      running.sort((a, b) => a.alias.localeCompare(b.alias));
+      stopped.sort((a, b) => a.alias.localeCompare(b.alias));
+      botAccounts = { running, stopped };
+      el('tab-running-count').textContent = running.length;
+      el('tab-stopped-count').textContent = stopped.length;
+      const totalAcc = (payload.totals && payload.totals.accounts) || (running.length + stopped.length);
+      el('bot-online-count').textContent = \`\${running.length} / \${totalAcc}\`;
+      renderBotList();
+      // Surface offline RDPs as a subtle warning (operator sees stopped bots from
+      // offline RDPs as HIDDEN — the accounts there cannot be fetched).
+      const offlineRdps = (payload.groups || []).filter(g => g.status === 'offline').length;
+      if (offlineRdps > 0) {
+        console.warn(\`[loadAccounts] \${offlineRdps} RDP(s) offline — accounts hidden\`);
+      }
+    } catch (e) {
+      console.error('loadAccounts', e);
+      el('bot-list').innerHTML = \`<div class="empty" style="padding: 12px 6px; font-size: 12px;">Error: \${escapeHtml(e.message)}</div>\`;
+    }
+  }
+
+  function renderBotList() {
+    const rows = botAccounts[currentBotTab] || [];
+    const list = el('bot-list');
+    if (!rows.length) {
+      const empty = currentBotTab === 'running' ? 'Belum ada bot running' : 'Semua bot running';
+      list.innerHTML = \`<div class="empty" style="padding: 12px 6px; font-size: 12px;">\${empty}</div>\`;
+      return;
+    }
+    list.innerHTML = rows.map(r => {
+      const isRunning = r.bot_state === 'running';
+      const btnLabel = isRunning ? 'Stop' : 'Start';
+      const btnClass = isRunning ? 'stop' : 'start';
+      const action = isRunning ? 'stop' : 'start';
+      const bank = r.app_source || inferBankFromRdp(r.rdp_hostname);
+      const bankTag = bank ? \`<span class="bot-bank \${bank}" style="margin-right: 8px;">\${bankShort(bank)}</span>\` : '';
+      return \`
+        <div class="bot-item-row" data-alias="\${escapeHtml(r.alias)}" data-rdp="\${escapeHtml(r.rdp_hostname)}">
+          <div class="bot-dot \${isRunning ? 'online' : 'offline'}"></div>
+          <div class="bot-meta">
+            <div class="bot-name">\${escapeHtml(r.alias)}</div>
+            <div class="bot-info">\${escapeHtml(r.device_id || '—')} · \${escapeHtml(r.rdp_hostname)}</div>
+          </div>
+          <div style="display:flex; align-items:center;">
+            \${bankTag}
+            <button class="bot-action-btn \${btnClass}" data-action="\${action}" data-alias="\${escapeHtml(r.alias)}" data-rdp="\${escapeHtml(r.rdp_hostname)}" onclick="handleBotAction(event)">\${btnLabel}</button>
+          </div>
+        </div>
+      \`;
+    }).join('');
+  }
+
+  // RDP hostname convention: RDP-TF-BRImoN / RDP-TF-myBCAn / RDP-TF-Seabankn.
+  // Fallback if accounts/list payload doesn't carry app_source.
+  function inferBankFromRdp(hostname) {
+    if (!hostname) return null;
+    const lower = hostname.toLowerCase();
+    if (lower.includes('brimo')) return 'brimo';
+    if (lower.includes('mybca')) return 'mybca';
+    if (lower.includes('seabank')) return 'seabank';
+    return null;
+  }
+
+  function switchBotTab(tab) {
+    if (tab !== 'running' && tab !== 'stopped') return;
+    currentBotTab = tab;
+    document.querySelectorAll('.bot-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+    renderBotList();
+  }
+
+  async function handleBotAction(evt) {
+    evt.stopPropagation();
+    const btn = evt.currentTarget;
+    const alias = btn.dataset.alias;
+    const rdp_hostname = btn.dataset.rdp;
+    const action = btn.dataset.action;
+    if (!alias || !rdp_hostname || !action) return;
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = action === 'start' ? 'Starting…' : 'Stopping…';
+    try {
+      const res = await fetch(\`/api/dashboard/bot/\${action}\`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alias, rdp_hostname }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        showToast('success', \`\${action === 'start' ? '▶' : '⏸'} \${alias} — \${data.bot_state || action}\`);
+        // Refresh sidebar after action ack. Socket bot:status will also fire
+        // for running→stopped transitions (control socket flow) but Stopped→
+        // Running path we need manual refresh since bot:register is per-engine.
+        await loadAccounts();
+      } else {
+        showToast('danger', \`\${action} \${alias} failed: \${data.detail || data.error || 'unknown'}\`);
+      }
+    } catch (err) {
+      showToast('danger', \`Network error: \${err.message}\`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
   }
 
   // ------- Actions -------
   function reloadSections() { loadQueue(); loadValidations(); loadHistory(); }
-  async function refreshAll() { await Promise.all([loadStats(), loadBots(), loadQueue(), loadValidations(), loadHistory()]); showToast('info', 'Refreshed'); }
+  async function refreshAll() { await Promise.all([loadStats(), loadAccounts(), loadQueue(), loadValidations(), loadHistory()]); showToast('info', 'Refreshed'); }
   function handleLogout() {
     if (!confirm('Sign out?')) return;
     window.location.href = '/logout';
@@ -3361,7 +3546,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     socket.on('task_completed', () => { loadStats(); loadQueue(); loadHistory(); });
     socket.on('new_task', () => { loadQueue(); loadStats(); });
     socket.on('task_ack', () => loadQueue());
-    socket.on('bot:status', () => loadBots());
+    socket.on('bot:status', () => loadAccounts());
     // Tailscale auto-accept + pending register events
     socket.on('tailscale:auto_accept_state', (data) => renderAutoAcceptToggle(data));
     // Cross-session sync untuk Auto-Approve toggle

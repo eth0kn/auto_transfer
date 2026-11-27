@@ -723,29 +723,40 @@ router.post('/bot/stop', async (req, res) => {
     return handleBotControl(req, res, 'stop');
 });
 
-// Shared handler for /bot/start + /bot/stop. Fan-out alias resolution + scope
-// check + round-trip to clientapp's `tg:bot_control` handler (via tg:bot_control_ack).
-async function handleBotControl(req, res, action) {
-    const { alias, rdp_hostname, operator_chat_id } = req.body || {};
+// Core bot start/stop logic. Pure async fn — returns { status, data } object.
+// Used by both Express wrapper (handleBotControl) and in-process callers
+// (e.g. dashboard remote control routes in index.js).
+//
+// Fan-out alias resolution + scope check + round-trip to clientapp's
+// `tg:bot_control` handler (via tg:bot_control_ack).
+//
+// For 'start', clientapp may await bot-started/bot-start-failed internal events
+// up to 15s. For 'stop', clientapp acks immediately after engine.stop() flip
+// (teardown happens asynchronously in the engine's .finally()). 20s backend
+// timeout = 5s safety over clientapp's 15s internal wait.
+async function botControl({ alias, rdp_hostname, operator_chat_id, action, audit_role }) {
     if (!alias || !operator_chat_id) {
-        return res.status(400).json({
-            error: 'missing_fields',
-            detail: 'required: alias, operator_chat_id (rdp_hostname optional)'
-        });
+        return { status: 400, data: { error: 'missing_fields', detail: 'required: alias, operator_chat_id (rdp_hostname optional)' } };
+    }
+    if (action !== 'start' && action !== 'stop') {
+        return { status: 400, data: { error: 'bad_action', detail: 'action must be start|stop' } };
     }
 
     // Resolve alias → RDP if not provided
     let resolvedRdp = rdp_hostname;
     if (!resolvedRdp) {
         const { hits, scanned } = await fanoutAliasLookup(alias, operator_chat_id);
-        if (scanned === 0) return res.status(403).json({ error: 'no_rdps_in_scope', detail: 'operator has no approved RDPs in scope' });
-        if (hits.length === 0) return res.status(404).json({ error: 'alias_not_found', detail: `alias "${alias}" not found in any of ${scanned} RDP(s)` });
+        if (scanned === 0) return { status: 403, data: { error: 'no_rdps_in_scope', detail: 'operator has no approved RDPs in scope' } };
+        if (hits.length === 0) return { status: 404, data: { error: 'alias_not_found', detail: `alias "${alias}" not found in any of ${scanned} RDP(s)` } };
         if (hits.length > 1) {
-            return res.status(300).json({
-                error: 'alias_ambiguous',
-                detail: `alias "${alias}" found in ${hits.length} RDPs`,
-                candidates: hits.map(h => ({ rdp_hostname: h.rdp_hostname, account_id: h.account_id, device_id: h.device_id }))
-            });
+            return {
+                status: 300,
+                data: {
+                    error: 'alias_ambiguous',
+                    detail: `alias "${alias}" found in ${hits.length} RDPs`,
+                    candidates: hits.map(h => ({ rdp_hostname: h.rdp_hostname, account_id: h.account_id, device_id: h.device_id }))
+                }
+            };
         }
         resolvedRdp = hits[0].rdp_hostname;
     }
@@ -757,17 +768,13 @@ async function handleBotControl(req, res, action) {
             await pool.execute(
                 `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
                  VALUES (?, ?, ?, ?, ?, ?)`,
-                [String(operator_chat_id), 'unknown', `/${action}`, `${alias}@${resolvedRdp}`, 'denied', scopeCheck.error]
+                [String(operator_chat_id), audit_role || 'unknown', `/${action}`, `${alias}@${resolvedRdp}`, 'denied', scopeCheck.error]
             );
         } catch (_) { /* non-blocking */ }
-        return res.status(403).json({ error: 'scope_denied', detail: scopeCheck.error });
+        return { status: 403, data: { error: 'scope_denied', detail: scopeCheck.error } };
     }
 
-    // Round-trip to clientapp `tg:bot_control` handler. For 'start', clientapp
-    // may await bot-started/bot-start-failed internal events up to 15s. For
-    // 'stop', clientapp acks immediately after engine.stop() flip (teardown
-    // happens asynchronously in the engine's .finally()). 20s backend timeout
-    // = 5s safety over clientapp's 15s internal wait.
+    // Round-trip to clientapp `tg:bot_control`.
     const rt = await callClientapp(resolvedRdp, 'tg:bot_control', { action, alias }, { timeout_ms: 20000 });
     const auditResult = rt.ok ? 'success' : (rt.error === 'scope_denied' ? 'denied' : 'error');
     const auditMsg = rt.ok ? null : `${rt.error}${rt.detail ? ':' + String(rt.detail).slice(0, 80) : ''}`;
@@ -775,13 +782,20 @@ async function handleBotControl(req, res, action) {
         await pool.execute(
             `INSERT INTO tg_audit_log (chat_id, role, cmd, args, result, error_message)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(operator_chat_id), scopeCheck.role, `/${action}`, `${alias}@${resolvedRdp}`, auditResult, auditMsg]
+            [String(operator_chat_id), audit_role || scopeCheck.role, `/${action}`, `${alias}@${resolvedRdp}`, auditResult, auditMsg]
         );
     } catch (e) {
         console.error('[TG-IPC] audit insert failed:', e.message);
     }
-    if (!rt.ok) return res.status(rt.status).json({ error: rt.error, detail: rt.detail });
-    return res.json({ ok: true, resolved_rdp: resolvedRdp, action, ...rt.result });
+    if (!rt.ok) return { status: rt.status, data: { error: rt.error, detail: rt.detail } };
+    return { status: 200, data: { ok: true, resolved_rdp: resolvedRdp, action, ...rt.result } };
+}
+
+// Thin Express wrapper for /api/tg/bot/start + /bot/stop.
+async function handleBotControl(req, res, action) {
+    const { alias, rdp_hostname, operator_chat_id } = req.body || {};
+    const result = await botControl({ alias, rdp_hostname, operator_chat_id, action });
+    return res.status(result.status).json(result.data);
 }
 
 // GET /api/tg/account/devices?rdp_hostname=X
@@ -858,4 +872,11 @@ router.get('/accounts/list', async (req, res) => {
     return res.json({ ok: true, ...result });
 });
 
-module.exports = { router, setDb, setEmitter, setControlSocketMap, setBotSocketMap, resolveAck };
+module.exports = {
+    router, setDb, setEmitter, setControlSocketMap, setBotSocketMap, resolveAck,
+    // In-process API for dashboard remote control (Phase 1 v4.6.0).
+    // Bypasses loopback+Bearer gate since these are called from the same Node
+    // process (index.js dashboard routes under cookie auth).
+    fanoutListAccounts,  // GET /api/dashboard/accounts proxy
+    botControl,          // POST /api/dashboard/bot/{start,stop} proxy
+};
