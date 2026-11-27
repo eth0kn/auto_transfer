@@ -71,6 +71,34 @@ async function resolveAliasOrPicker(ctx, action, alias, extraContext = {}) {
     return { pickerShown: true };
 }
 
+// v4.5.2 (2026-11-27): parseAliasArgs — unified CLI arg parser untuk 4 handler
+// (/delete, /edit, /start_bot, /stop_bot). Fix root cause: operator.js split /\s+/
+// truncate alias setelah first space → akun "fajar 01" ditolak sebagai rdp_hostname
+// '01'. Solution: quoted syntax `"alias with space"` + fallback back-compat.
+//
+// Syntax supported:
+//   /cmd alias                        → { alias, rdp_hostname: null }
+//   /cmd alias rdp                    → { alias, rdp_hostname: "rdp" }  back-compat
+//   /cmd "alias with space"           → { alias: "alias with space", rdp_hostname: null }
+//   /cmd "alias with space" rdp       → { alias: "alias with space", rdp_hostname: "rdp" }
+//
+// Returns: { alias, rdp_hostname } — alias null kalau body kosong (handler shows usage).
+function parseAliasArgs(text) {
+    // Strip command token (e.g. "/start_bot" or "/start_bot@botname")
+    const body = (text || '').trim().replace(/^\/\S+\s*/, '').trim();
+    if (!body) return { alias: null, rdp_hostname: null };
+
+    // Quoted alias: "alias with space" [rdp]
+    const quoted = body.match(/^"([^"]+)"\s*(.*)$/);
+    if (quoted) {
+        return { alias: quoted[1], rdp_hostname: (quoted[2].trim() || null) };
+    }
+
+    // Unquoted: space-split (back-compat for single-word alias)
+    const parts = body.split(/\s+/);
+    return { alias: parts[0], rdp_hostname: parts[1] || null };
+}
+
 // Sprint 2c + v4.3.6 hotfix: /edit field whitelist aligned with clientapp DB schema.
 // Scanner report 2026-11-22: clientapp accounts table has NO username / api_key columns.
 // Login BRImo pakai password saja (alias cuma UI label).
@@ -261,23 +289,22 @@ async function handleStatus(ctx) {
 
 async function handleDelete(ctx) {
     const r = ctx.state.role;
-    const text = ctx.message?.text || '';
-    const parts = text.trim().split(/\s+/);
-    // v4.3.10 Sprint 3: rdp_hostname OPTIONAL (alias-only mode).
-    // Operator policy: alias unique cross-RDP (not enforced by code).
-    if (parts.length < 2) {
+    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
+    const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
+    if (!alias) {
         await ctx.reply(
             'Usage: <code>/delete &lt;alias&gt; [rdp_hostname]</code>\n\n' +
             'Examples:\n' +
             '• <code>/delete fajar-01</code> — auto-resolve RDP\n' +
-            '• <code>/delete fajar-01 RDP-01</code> — explicit routing',
+            '• <code>/delete fajar-01 RDP-01</code> — explicit routing\n' +
+            '• <code>/delete "Toko A 123"</code> — alias dengan spasi (pakai tanda kutip)\n' +
+            '• <code>/delete "Toko A 123" RDP-01</code> — alias dengan spasi + RDP',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', result: 'rejected', error_message: 'missing_args' });
         return;
     }
-    const alias = parts[1];
-    let rdp_hostname = parts[2]; // may be undefined
+    let rdp_hostname = rdpArg; // may be null
 
     if (!rdp_hostname) {
         const resolved = await resolveAliasOrPicker(ctx, 'delete', alias);
@@ -440,22 +467,22 @@ async function handleDeleteCancel(ctx) {
 
 async function handleEdit(ctx) {
     const r = ctx.state.role;
-    const text = ctx.message?.text || '';
-    const parts = text.trim().split(/\s+/);
-    // v4.3.10 Sprint 3: rdp_hostname OPTIONAL.
-    if (parts.length < 2) {
+    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
+    const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
+    if (!alias) {
         await ctx.reply(
             'Usage: <code>/edit &lt;alias&gt; [rdp_hostname]</code>\n\n' +
             'Examples:\n' +
             '• <code>/edit fajar-01</code> — auto-resolve RDP\n' +
-            '• <code>/edit fajar-01 RDP-01</code> — explicit routing',
+            '• <code>/edit fajar-01 RDP-01</code> — explicit routing\n' +
+            '• <code>/edit "Toko A 123"</code> — alias dengan spasi (pakai tanda kutip)\n' +
+            '• <code>/edit "Toko A 123" RDP-01</code> — alias dengan spasi + RDP',
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/edit', result: 'rejected', error_message: 'missing_args' });
         return;
     }
-    const alias = parts[1];
-    let rdp_hostname = parts[2];
+    let rdp_hostname = rdpArg;
 
     if (!rdp_hostname) {
         const resolved = await resolveAliasOrPicker(ctx, 'edit', alias);
@@ -1277,21 +1304,24 @@ async function handleStop(ctx)  { return handleStartStop(ctx, 'stop'); }
 
 async function handleStartStop(ctx, action) {
     const r = ctx.state.role;
-    const text = ctx.message?.text || '';
-    const parts = text.trim().split(/\s+/);
-    if (parts.length < 2) {
+    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
+    // Also fix pre-existing Usage text: command is /start_bot (not /start) per index.js:28-29.
+    const cmd = `${action}_bot`;
+    const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
+    if (!alias) {
         await ctx.reply(
-            `Usage: <code>/${action} &lt;alias&gt; [rdp_hostname]</code>\n\n` +
+            `Usage: <code>/${cmd} &lt;alias&gt; [rdp_hostname]</code>\n\n` +
             'Examples:\n' +
-            `• <code>/${action} fajar-01</code> — auto-resolve RDP\n` +
-            `• <code>/${action} fajar-01 RDP-01</code> — explicit routing`,
+            `• <code>/${cmd} fajar-01</code> — auto-resolve RDP\n` +
+            `• <code>/${cmd} fajar-01 RDP-01</code> — explicit routing\n` +
+            `• <code>/${cmd} "Toko A 123"</code> — alias dengan spasi (pakai tanda kutip)\n` +
+            `• <code>/${cmd} "Toko A 123" RDP-01</code> — alias dengan spasi + RDP`,
             { parse_mode: 'HTML' }
         );
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: `/${action}`, result: 'rejected', error_message: 'missing_args' });
         return;
     }
-    const alias = parts[1];
-    let rdp_hostname = parts[2];
+    let rdp_hostname = rdpArg;
 
     if (!rdp_hostname) {
         const resolved = await resolveAliasOrPicker(ctx, action, alias);
