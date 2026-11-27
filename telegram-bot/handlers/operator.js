@@ -11,18 +11,24 @@ const { escapeHtml } = require('../util');
 const { postJson, getJson } = require('../backend-client');
 const { startWizard, getActiveWizard, advanceWizard, cancelWizard } = require('../wizard');
 
+// v4.5.4 (2026-11-27): unified confirm TTL via TG_CONFIRM_TTL_SEC (default 60s).
+// Used for both pendingDeletes (destructive confirm) and pendingPickers (ambiguity).
+// Previously hardcoded 60s but env advertised 30 → inconsistency; 60 wins as canonical
+// (matches original UX intent + user-visible text at handleDelete reply).
+const CONFIRM_TTL_MS = parseInt(process.env.TG_CONFIRM_TTL_SEC || '60', 10) * 1000;
+
 // Short-lived pending-delete confirmations (callback_data cap 64 bytes)
 // key = random 12-char hex id → {alias, rdp_hostname, operator_chat_id, expires_at}
-// 60s TTL, auto-cleanup via setTimeout
+// TTL via TG_CONFIRM_TTL_SEC, auto-cleanup via setTimeout
 const pendingDeletes = new Map();
-const PENDING_TTL_MS = 60 * 1000;
+const PENDING_TTL_MS = CONFIRM_TTL_MS;
 
 // Sprint 3 (v4.3.10): pending alias→RDP picker when /start /stop /edit /delete
 // called WITHOUT rdp_hostname and fan-out resolution returns >1 hit.
 // key = 12-char hex cbid → { action, alias, candidates[], operator_chat_id, expires_at,
 //                            extra: {field?, value?, ...} for action-specific context }
 const pendingPickers = new Map();
-const PICKER_TTL_MS = 60 * 1000;
+const PICKER_TTL_MS = CONFIRM_TTL_MS;
 
 /**
  * Sprint 3 helper — resolve alias → RDP via fan-out. Returns:
@@ -380,7 +386,7 @@ async function deleteShowConfirm(ctx, alias, rdp_hostname) {
         `Account: <code>${escapeHtml(alias)}</code>\n` +
         `RDP: <code>${escapeHtml(rdp_hostname)}</code>\n\n` +
         `<i>This will stop the bot and remove the account DB row. Non-recoverable.</i>\n\n` +
-        `⏱ Confirm within 60s.`,
+        `⏱ Confirm within ${PENDING_TTL_MS / 1000}s.`,
         {
             parse_mode: 'HTML',
             reply_markup: {

@@ -33,4 +33,25 @@ async function logAudit(params) {
     }
 }
 
-module.exports = { logAudit };
+/**
+ * v4.5.4 (2026-11-27): purge audit log rows older than N days.
+ * Called periodically from telegram-bot/index.js retention cron.
+ * Fail-open — returns 0 on error (console.error logged).
+ * @param {number} days  retention window in days (default 90 if invalid)
+ * @returns {Promise<number>} count of rows deleted
+ */
+async function purgeOldAudit(days) {
+    const d = Number.isFinite(days) && days > 0 ? Math.floor(days) : 90;
+    try {
+        const [result] = await pool.execute(
+            'DELETE FROM tg_audit_log WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+            [d]
+        );
+        return result.affectedRows || 0;
+    } catch (e) {
+        console.error('[audit] purge failed:', e.message);
+        return 0;
+    }
+}
+
+module.exports = { logAudit, purgeOldAudit };

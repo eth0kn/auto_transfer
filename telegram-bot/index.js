@@ -18,6 +18,9 @@ const { registerHandlers } = require('./handlers');
 const { pool } = require('./db');
 // v4.5.3 (2026-11-27): shadow state persistence via app_config
 const { initShadowState, shadowState } = require('./shadow');
+// v4.5.4 (2026-11-27): retention cron — purge old audit + expired wizard rows
+const { purgeOldAudit } = require('./audit');
+const { cleanupExpired: cleanupExpiredWizards } = require('./wizard');
 
 // ==========================================================
 // Config Validation (fail-fast)
@@ -107,6 +110,28 @@ async function healthCheck() {
 
     // v4.5.3: load shadow state dari app_config (fallback env kalau row belum ada)
     await initShadowState(pool);
+
+    // v4.5.4 (2026-11-27): hourly retention cron — purge old audit + expired wizard rows.
+    // Env TG_AUDIT_RETENTION_DAYS (default 90). Both helpers fail-open (never throw).
+    // unref() so cron tick never blocks SIGTERM graceful shutdown.
+    const AUDIT_RETENTION_DAYS = parseInt(process.env.TG_AUDIT_RETENTION_DAYS || '90', 10);
+    const CRON_TICK_MS = 60 * 60 * 1000; // 1 hour
+    const retentionCron = setInterval(async () => {
+        try {
+            const pruned = await purgeOldAudit(AUDIT_RETENTION_DAYS);
+            if (pruned > 0) console.log(`🧹 [cron] purged ${pruned} audit log rows (>${AUDIT_RETENTION_DAYS}d)`);
+        } catch (e) {
+            console.error('[cron] purgeOldAudit error:', e.message);
+        }
+        try {
+            const expired = await cleanupExpiredWizards();
+            if (expired > 0) console.log(`🧹 [cron] cleaned ${expired} expired wizard rows`);
+        } catch (e) {
+            console.error('[cron] cleanupExpiredWizards error:', e.message);
+        }
+    }, CRON_TICK_MS);
+    retentionCron.unref();
+    console.log(`✅ [cron] retention tick scheduled — every ${CRON_TICK_MS / 60000} min (audit >${AUDIT_RETENTION_DAYS}d + wizard expired)`);
 
     // Log BEFORE bot.launch() because launch() long-polling never resolves
     console.log(`✅ [BOT] Telegram bot starting — long-polling mode`);
