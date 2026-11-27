@@ -1,6 +1,5 @@
 // Telegram Bot — Backend IPC Client
-// Sprint 2b (2026-11-22): axios wrapper for /api/tg/* with Bearer auth.
-// Decisions Q5=C, Q6=C locked — REST via loopback 127.0.0.1 + Bearer token.
+// Axios wrapper for /api/tg/* over loopback 127.0.0.1 with Bearer token auth.
 
 const axios = require('axios');
 
@@ -41,7 +40,7 @@ async function postJson(path, body) {
 }
 
 /**
- * GET helper (less-used in Sprint 2b). Returns {ok, status, data}.
+ * GET helper. Returns {ok, status, data}.
  */
 async function getJson(path) {
     try {
@@ -56,8 +55,4 @@ async function getJson(path) {
     }
 }
 
-async function getBackendHealth() {
-    return getJson('/health');
-}
-
-module.exports = { postJson, getJson, getBackendHealth };
+module.exports = { postJson, getJson };

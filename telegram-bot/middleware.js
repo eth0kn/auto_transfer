@@ -1,5 +1,4 @@
 // Telegram Bot — Middleware (3-tier defense + role resolver)
-// Compliance: B2.6 Role Matrix locked 2026-11-22
 // - Tier 1: private chat only
 // - Tier 2: no forward chain
 // - Tier 3: role resolution (owner > operator > unknown)
@@ -9,7 +8,7 @@ const { logAudit } = require('./audit');
 
 /**
  * Resolve role for incoming update (message OR callback_query).
- * Sprint 2b: callback_query support via unified ctx.from + ctx.chat.
+ * Supports callback_query via unified ctx.from + ctx.chat.
  * Returns: { role, chat_id, operator?, reject_reason? }
  */
 async function resolveRole(ctx) {
@@ -107,7 +106,7 @@ function requireRole(allowedRoles) {
     return async (ctx, next) => {
         const r = ctx.state.role;
         if (!allowedRoles.includes(r.role)) {
-            // F6 mini-scan Sprint 2b fix: audit cmd/args for callback_query too
+            // Audit cmd/args for callback_query too
             const cmd = ctx.message?.text?.split(' ')[0] || ctx.callbackQuery?.data || 'unknown';
             const args = ctx.message?.text || ctx.callbackQuery?.data || null;
             const { escapeHtml } = require('./util');

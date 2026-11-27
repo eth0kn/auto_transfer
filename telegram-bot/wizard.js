@@ -1,5 +1,4 @@
 // Telegram Bot — Wizard Session Manager
-// Sprint 2a (2026-11-22)
 //
 // One wizard per chat_id at a time (PK chat_id).
 // TTL from TG_WIZARD_TIMEOUT_MIN env (default 15 min).
@@ -64,16 +63,17 @@ async function getActiveWizard(chatId) {
 /**
  * Advance wizard to next step, merge new data fields.
  *
- * F2 Sprint 2c fix: atomic via single UPDATE with JSON_SET + JSON_MERGE_PATCH.
- * InnoDB row-level lock serializes concurrent UPDATEs on same chat_id,
- * so the merge never clobbers a concurrent peer's field write
- * (e.g. two callback_queries arriving nearly simultaneously).
- * Previous read-modify-write pattern had a lost-write race between SELECT and UPDATE.
+ * Atomic via single UPDATE with JSON_SET + JSON_MERGE_PATCH.
+ * InnoDB row-level lock serializes concurrent UPDATEs on same chat_id, so the
+ * merge never clobbers a concurrent peer's field write (e.g. two callback_queries
+ * arriving nearly simultaneously). Replaces earlier read-modify-write pattern
+ * which had a lost-write race between SELECT and UPDATE.
  *
- * F1 Sprint 2c mini-scan fix: optional expectedCurrentStep gate.
- * When provided, the UPDATE's WHERE clause also requires `JSON_EXTRACT($.step) = expectedCurrentStep`.
- * This gives us an atomic compare-and-set used as a one-shot lock on destructive confirmations
- * (double-click "✅ YES" won't fire the backend call twice; only the first caller gets affectedRows=1).
+ * Optional expectedCurrentStep gate (compare-and-set lock):
+ * When provided, the UPDATE's WHERE clause also requires
+ * `JSON_EXTRACT($.step) = expectedCurrentStep`. This gives us an atomic CAS
+ * used as a one-shot lock on destructive confirmations (double-click "✅ YES"
+ * won't fire the backend call twice; only the first caller gets affectedRows=1).
  *
  * @param {string|number} chatId
  * @param {string} nextStep

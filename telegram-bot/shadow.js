@@ -1,21 +1,21 @@
 // Telegram Bot — Shadow Observability Helper
-// B2.5 locked 2026-11-22 — asymmetric owner monitoring
+// Asymmetric owner monitoring:
 // - Owner tau SEMUA operator command (default ON)
 // - Owner chat TIDAK di-forward ke operator (asymmetric, enforced here)
 //
-// Sprint 2a (F2): rate limit batching — cooldown + accumulate dropped count.
-// If operator spams within COOLDOWN_MS, drops are counted and appended to next
-// normal send as "(+N prior rate-limited)".
+// Rate limit batching — cooldown + accumulate dropped count. If operator spams
+// within COOLDOWN_MS, drops are counted and appended to next normal send as
+// "(+N prior rate-limited)".
 
 const { escapeHtml } = require('./util');
 
 const COOLDOWN_MS = parseInt(process.env.TG_SHADOW_COOLDOWN_MS || '2000', 10);
 const operatorRateState = new Map(); // chat_id → { lastSentAt, droppedCount, firstDropAt }
 
-// v4.5.3 (2026-11-27): shadow runtime state — persisted via app_config DB table.
+// Shadow runtime state — persisted via app_config DB table.
 // Loaded at bot boot via initShadowState(pool). Mutated by /shadow TG command
 // (owner.js handleShadow) + persisted back via updateShadowState(pool, key, val).
-// Fallback to env vars for first-boot migration period (kalau DB rows belum ada).
+// Fallback to env vars kalau DB rows belum ada.
 const shadowState = {
     enabled: (process.env.TG_SHADOW_ENABLED || 'true') === 'true',
     filter:  process.env.TG_SHADOW_FILTER  || 'all',
@@ -120,7 +120,7 @@ function shouldForward(eventType, filter) {
  * @param {'success'|'error'|'denied'|'destructive'} [params.eventType='success']
  */
 async function forwardToOwner({ ctx, operatorChatId, operatorLabel, cmd, result, eventType = 'success' }) {
-    // v4.5.3: read from in-memory shadowState (persisted via app_config, loaded at boot).
+    // Read from in-memory shadowState (persisted via app_config, loaded at boot).
     if (!shadowState.enabled) return;
     if (!shouldForward(eventType, shadowState.filter)) return;
 
@@ -130,10 +130,10 @@ async function forwardToOwner({ ctx, operatorChatId, operatorLabel, cmd, result,
     // Asymmetric enforcement: never forward to anyone BUT owner
     if (String(operatorChatId) === String(ownerChatId)) return; // self — skip
 
-    // F2 rate limit: cooldown + accumulate
+    // Rate limit: cooldown + accumulate.
     // ONLY 'error' events bypass cooldown (genuine backend/bot failures — rare + informative).
-    // 'denied' events respect cooldown — F1 mini-scan Sprint 2a fix: rogue operator spamming
-    // owner-only commands (e.g. /approve_rdp x y z) would otherwise flood owner unthrottled.
+    // 'denied' events respect cooldown — rogue operator spamming owner-only commands
+    // (e.g. /approve_rdp x y z) would otherwise flood owner unthrottled.
     const bypassCooldown = (eventType === 'error');
     const key = String(operatorChatId);
     const now = Date.now();
@@ -217,7 +217,7 @@ module.exports = {
     notifyOwnerDenied,
     notifyOwnerUnknown,
     nowWIB,
-    // v4.5.3: persistence API
+    // Persistence API (app_config DB table)
     shadowState,          // live object — read .enabled / .filter
     initShadowState,      // call at bot startup (telegram-bot/index.js)
     updateShadowState,    // call from owner.js handleShadow to toggle+persist

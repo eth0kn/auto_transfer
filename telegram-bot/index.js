@@ -1,9 +1,5 @@
 /**
- * Telegram Bot — Remote Admin for auto_transfer + clientapps
- * Sprint 1 Foundation (2026-11-22)
- *
- * Concept: docs/feature_telegram_bot_concept_2026-11-21.md
- * Sprint 1: docs/feature_telegram_bot_sprint1_2026-11-22.md
+ * Telegram Bot — Remote Admin for auto_transfer + clientapps.
  *
  * Runs as PM2 app `telegram-bot`, sibling to `unified-backend`.
  * Shares .env at /var/automate/auto_transfer/.env (via root dotenv.config()).
@@ -16,9 +12,9 @@ const { Telegraf } = require('telegraf');
 const { roleMiddleware } = require('./middleware');
 const { registerHandlers } = require('./handlers');
 const { pool } = require('./db');
-// v4.5.3 (2026-11-27): shadow state persistence via app_config
+// Shadow state persistence via app_config (loaded at boot)
 const { initShadowState, shadowState } = require('./shadow');
-// v4.5.4 (2026-11-27): retention cron — purge old audit + expired wizard rows
+// Retention cron — purge old audit + expired wizard rows
 const { purgeOldAudit } = require('./audit');
 const { cleanupExpired: cleanupExpiredWizards } = require('./wizard');
 
@@ -49,12 +45,11 @@ bot.use(roleMiddleware);
 // Register all command handlers
 registerHandlers(bot);
 
-// v4.3.11 Sprint 3 polish (2026-11-22): publish command list to Telegram so
-// operator sees autocomplete hints when typing "/". Role middleware still
-// gates execution — non-authorized users see the command but get rejected
-// on invoke. Scope: default (all chats). Owner-only commands intentionally
-// omitted from this public list to avoid info disclosure to unknown users
-// who stumble on the bot.
+// Publish command list to Telegram so operator sees autocomplete hints when
+// typing "/". Role middleware still gates execution — non-authorized users
+// see the command but get rejected on invoke. Scope: default (all chats).
+// Owner-only commands intentionally omitted from this public list to avoid
+// info disclosure to unknown users who stumble on the bot.
 const BOT_COMMANDS = [
     { command: 'start',         description: 'Greeting + role check' },
     { command: 'whoami',        description: 'Show my chat_id + role' },
@@ -108,10 +103,10 @@ async function healthCheck() {
 (async () => {
     await healthCheck();
 
-    // v4.5.3: load shadow state dari app_config (fallback env kalau row belum ada)
+    // Load shadow state dari app_config (fallback env kalau row belum ada)
     await initShadowState(pool);
 
-    // v4.5.4 (2026-11-27): hourly retention cron — purge old audit + expired wizard rows.
+    // Hourly retention cron — purge old audit + expired wizard rows.
     // Env TG_AUDIT_RETENTION_DAYS (default 90). Both helpers fail-open (never throw).
     // unref() so cron tick never blocks SIGTERM graceful shutdown.
     const AUDIT_RETENTION_DAYS = parseInt(process.env.TG_AUDIT_RETENTION_DAYS || '90', 10);

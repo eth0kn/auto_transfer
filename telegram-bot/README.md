@@ -2,8 +2,7 @@
 
 Sibling PM2 process to `unified-backend`, same folder (`/var/automate/auto_transfer/`).
 
-Feature concept: [../docs/feature_telegram_bot_concept_2026-11-21.md](../docs/feature_telegram_bot_concept_2026-11-21.md)
-Sprint 1 tracking: [../docs/feature_telegram_bot_sprint1_2026-11-22.md](../docs/feature_telegram_bot_sprint1_2026-11-22.md)
+Feature concept + history: see repo `docs/` folder.
 
 ## Setup
 
@@ -62,7 +61,7 @@ pm2 logs telegram-bot --lines 30 --nostream
 - **Stop**: `pm2 stop telegram-bot`
 - **Status**: `pm2 status telegram-bot`
 
-## Commands (Sprint 1)
+## Commands
 
 ### Public (any role)
 - `/start` — greeting

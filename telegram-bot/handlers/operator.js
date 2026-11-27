@@ -1,7 +1,5 @@
 // Telegram Bot — Operator Handlers
-// Scope: OPERATOR_ALLOWED (operator + owner can call)
-// Sprint 1: /list and /status are stubs — Sprint 2+ will wire to backend socket IPC
-// Sprint 2b: /delete with inline-button confirm, backend IPC via REST
+// Scope: OPERATOR_ALLOWED (operator + owner can call).
 
 const crypto = require('crypto');
 const { pool } = require('../db');
@@ -11,10 +9,9 @@ const { escapeHtml } = require('../util');
 const { postJson, getJson } = require('../backend-client');
 const { startWizard, getActiveWizard, advanceWizard, cancelWizard } = require('../wizard');
 
-// v4.5.4 (2026-11-27): unified confirm TTL via TG_CONFIRM_TTL_SEC (default 60s).
+// Unified confirm TTL via TG_CONFIRM_TTL_SEC (default 60s).
 // Used for both pendingDeletes (destructive confirm) and pendingPickers (ambiguity).
-// Previously hardcoded 60s but env advertised 30 → inconsistency; 60 wins as canonical
-// (matches original UX intent + user-visible text at handleDelete reply).
+// 60 wins as canonical — matches user-visible text at handleDelete reply.
 const CONFIRM_TTL_MS = parseInt(process.env.TG_CONFIRM_TTL_SEC || '60', 10) * 1000;
 
 // Short-lived pending-delete confirmations (callback_data cap 64 bytes)
@@ -23,15 +20,15 @@ const CONFIRM_TTL_MS = parseInt(process.env.TG_CONFIRM_TTL_SEC || '60', 10) * 10
 const pendingDeletes = new Map();
 const PENDING_TTL_MS = CONFIRM_TTL_MS;
 
-// Sprint 3 (v4.3.10): pending alias→RDP picker when /start /stop /edit /delete
-// called WITHOUT rdp_hostname and fan-out resolution returns >1 hit.
+// Pending alias→RDP picker when /start /stop /edit /delete is called WITHOUT
+// rdp_hostname and fan-out resolution returns >1 hit.
 // key = 12-char hex cbid → { action, alias, candidates[], operator_chat_id, expires_at,
 //                            extra: {field?, value?, ...} for action-specific context }
 const pendingPickers = new Map();
 const PICKER_TTL_MS = CONFIRM_TTL_MS;
 
 /**
- * Sprint 3 helper — resolve alias → RDP via fan-out. Returns:
+ * Resolve alias → RDP via fan-out. Returns:
  *   - { rdp_hostname }                 // auto-resolved (1 hit) → caller proceeds
  *   - { pickerShown: true }            // N>1 hit → picker message rendered, caller returns
  *   - { error: 'not_found'|'...' }     // 0 hit / no scope → caller sends error reply
@@ -77,10 +74,10 @@ async function resolveAliasOrPicker(ctx, action, alias, extraContext = {}) {
     return { pickerShown: true };
 }
 
-// v4.5.2 (2026-11-27): parseAliasArgs — unified CLI arg parser untuk 4 handler
-// (/delete, /edit, /start_bot, /stop_bot). Fix root cause: operator.js split /\s+/
-// truncate alias setelah first space → akun "fajar 01" ditolak sebagai rdp_hostname
-// '01'. Solution: quoted syntax `"alias with space"` + fallback back-compat.
+// parseAliasArgs — unified CLI arg parser untuk 4 handler (/delete, /edit,
+// /start_bot, /stop_bot). Earlier split /\s+/ truncated alias at first space
+// (e.g. alias "fajar 01" treated rdp_hostname as '01'). Fix: quoted syntax
+// `"alias with space"` + fallback back-compat with single-word unquoted alias.
 //
 // Syntax supported:
 //   /cmd alias                        → { alias, rdp_hostname: null }
@@ -105,15 +102,12 @@ function parseAliasArgs(text) {
     return { alias: parts[0], rdp_hostname: parts[1] || null };
 }
 
-// Sprint 2c + v4.3.6 hotfix: /edit field whitelist aligned with clientapp DB schema.
-// Scanner report 2026-11-22: clientapp accounts table has NO username / api_key columns.
-// Login BRImo pakai password saja (alias cuma UI label).
-// v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped from whitelist — auto-derived
-// from device_id via CGNAT regex at clientapp side (mirror UI readonly behavior).
-// keep_balance added — numeric "Sisakan Saldo Minimal (Rp)" matches clientapp modal.
-// v4.3.17 / Sprint 3 polish (2026-11-23): mutasi_enabled added — ON/OFF inline
-// picker, parity dgn dashboard modal checkbox inp-mutasi-enabled.
-// Field whitelist: alias | password | callback_url | device_id | keep_balance | mutasi_enabled (6 fields).
+// /edit field whitelist aligned with clientapp accounts DB schema.
+// Clientapp accounts table has NO username / api_key columns — login banking
+// app pakai password saja (alias cuma UI label). remote_ip auto-derived from
+// device_id via CGNAT regex at clientapp side. mutasi_enabled parity dgn
+// dashboard modal checkbox inp-mutasi-enabled.
+// Field whitelist (6 fields): alias | password | callback_url | device_id | keep_balance | mutasi_enabled.
 const EDIT_FIELDS = [
     { key: 'alias',          label: 'Alias' },
     { key: 'password',       label: 'Password' },
@@ -125,8 +119,8 @@ const EDIT_FIELDS = [
 const SENSITIVE_EDIT_FIELDS = new Set(['password']);
 function maskForDisplay(field, value) {
     if (SENSITIVE_EDIT_FIELDS.has(field)) return '••••••••';
-    // v4.3.17 Sprint 3 polish: mutasi_enabled stored as '1'/'0' string in wizard
-    // (set by handleEditMutasiPick), render as human-readable state for confirm page.
+    // mutasi_enabled stored as '1'/'0' string in wizard (set by handleEditMutasiPick);
+    // render as human-readable state for confirm page.
     if (field === 'mutasi_enabled') {
         return value === '1' || value === 1 || value === true ? '🟢 ON' : '⚫ OFF';
     }
@@ -134,17 +128,11 @@ function maskForDisplay(field, value) {
     return value.length > 60 ? value.slice(0, 57) + '...' : value;
 }
 
-// Sprint 2d-1 + v4.3.6 hotfix: /add wizard — 3 banking fields aligned with
-// clientapp schema (alias + password + callback_url). Optional bank fields
-// (device_id, remote_ip, keep_balance, mutasi_enabled, mirror_enabled) defer.
-// Alias constraint relaxed: unrestricted printable, ≤128 chars.
-//
-// Sprint 2d-2 (v4.3.7): add ADB pair step per Q2=C locked. 2 extra wizard steps
-// after callback_url collect `device_ip` (IP:PAIR_PORT shown on HP wireless
-// debugging dialog) + `pair_code` (6-digit shown with it). Backend sends
-// `adb pair <ip> <code>` to RDP via socket at Sprint 2e; scaffold returns 501.
-// Sprint 2e-3 (v4.3.9, 2026-11-22): keep_balance added — matches clientapp modal
-// field "Sisakan Saldo Minimal (Rp)". Integer ≥0. Accept `0` for no threshold.
+// /add wizard — 6 steps: 3 banking fields (alias + password + callback_url) +
+// numeric keep_balance ("Sisakan Saldo Minimal") + ADB pair (device_ip:PORT +
+// 6-digit pair_code). Alias constraint relaxed: unrestricted printable, ≤128 chars.
+// Backend sends `adb pair <ip> <code>` to the target RDP via socket at /account/add
+// invocation.
 const ADD_STEPS = [
     { key: 'alias',        label: 'Alias',        prompt: 'Send the <b>alias</b> (free text, space allowed, ≤128 chars). Example: <code>Toko A 123</code>' },
     { key: 'password',     label: 'Password',     prompt: 'Send the <b>password</b> untuk login banking app (BRImo / myBCA / SeaBank).\n\n<i>⚠️ Sensitive — won\'t be echoed in audit.</i>' },
@@ -207,8 +195,8 @@ function nextAddStep(currentKey) {
 
 async function handleList(ctx) {
     const r = ctx.state.role;
-    // v4.3.x: lists approved RDPs (overview). Detailed account inventory per
-    // RDP tersedia via /list_accounts (v4.3.14+ — aggregated multi-RDP view).
+    // Lists approved RDPs (overview). Detailed account inventory per RDP
+    // tersedia via /list_accounts (aggregated multi-RDP view).
     let scope;
     if (r.role === 'owner') {
         scope = 'ALL (owner — no RDP restriction)';
@@ -251,9 +239,9 @@ async function handleList(ctx) {
 
 async function handleStatus(ctx) {
     const r = ctx.state.role;
-    // v4.5.3 (2026-11-27): /status aggregate snapshot via /api/tg/status endpoint.
-    // Data: RDP+operator counts, bot+control socket counts per app_source, queue
-    // depth, today's stats. Per-RDP scope-filtered breakdown deferred (G8 /health_all).
+    // /status aggregate snapshot via /api/tg/status endpoint.
+    // Data: RDP+operator counts, bot+control socket counts per app_source,
+    // queue depth, today's stats. Per-RDP scope-filtered breakdown deferred.
     try {
         const resp = await getJson('/status');
         if (!resp.ok) {
@@ -322,12 +310,11 @@ async function handleStatus(ctx) {
 }
 
 // ==========================================================
-// /delete — Sprint 2b
+// /delete
 // ==========================================================
 
 async function handleDelete(ctx) {
     const r = ctx.state.role;
-    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
     const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
     if (!alias) {
         await ctx.reply(
@@ -366,8 +353,8 @@ async function handleDelete(ctx) {
     return deleteShowConfirm(ctx, alias, rdp_hostname);
 }
 
-// Sprint 3 refactor: confirm-page rendering factored out so pick_rdp picker
-// can resume into it after resolving the ambiguous alias.
+// Confirm-page rendering factored out so pick_rdp picker can resume into it
+// after resolving the ambiguous alias.
 async function deleteShowConfirm(ctx, alias, rdp_hostname) {
     const r = ctx.state.role;
     // Generate short random callback id (6 bytes = 12 hex chars — fits callback_data 64-byte cap)
@@ -397,8 +384,8 @@ async function deleteShowConfirm(ctx, alias, rdp_hostname) {
             }
         }
     );
-    // F2 Sprint 2c mini-scan fix: result enum is success|denied|error|rejected only.
-    // Pre-existing bug mirrors F9 (Sprint 2b) that already fixed the confirm path.
+    // result enum is success|denied|error|rejected only — awaiting_confirm
+    // goes in error_message instead of inventing a new result value.
     await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/delete', args: `${alias}@${rdp_hostname}`, result: 'success', error_message: 'awaiting_confirm' });
 }
 
@@ -428,8 +415,7 @@ async function handleDeleteConfirm(ctx) {
         operator_chat_id: pending.operator_chat_id
     });
 
-    // F9 mini-scan Sprint 2b fix: result enum is success|denied|error|rejected only.
-    // Scaffold status goes in error_message instead of inventing a new result value.
+    // result enum is success|denied|error|rejected only.
     let replyText;
     let auditResult;
     let auditErrMsg = null;
@@ -494,13 +480,12 @@ async function handleDeleteCancel(ctx) {
 }
 
 // ==========================================================
-// /edit — Sprint 2c
+// /edit
 // Wizard flow: pick_field → await_value → confirm → POST backend
 // ==========================================================
 
 async function handleEdit(ctx) {
     const r = ctx.state.role;
-    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
     const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
     if (!alias) {
         await ctx.reply(
@@ -539,8 +524,8 @@ async function handleEdit(ctx) {
     return editShowFieldPicker(ctx, alias, rdp_hostname);
 }
 
-// Sprint 3 refactor: field-picker rendering factored out so pick_rdp picker
-// can resume into it after resolving the ambiguous alias.
+// Field-picker rendering factored out so pick_rdp picker can resume into it
+// after resolving the ambiguous alias.
 async function editShowFieldPicker(ctx, alias, rdp_hostname) {
     const r = ctx.state.role;
     try {
@@ -584,13 +569,13 @@ async function handleEditFieldPick(ctx) {
         return;
     }
 
-    // Sprint 2e-3 (v4.3.9): device_id gets a dropdown of live devices from the RDP
-    // instead of free-text input. Mirrors clientapp modal behavior (<select>).
+    // device_id gets a dropdown of live devices from the RDP instead of free-text
+    // input. Mirrors clientapp modal behavior (<select>).
     if (fieldKey === 'device_id') {
         return handleEditFieldDeviceIdPick(ctx, active, fieldDef);
     }
-    // Sprint 3 polish (v4.3.17): mutasi_enabled gets ON/OFF inline keyboard
-    // picker — mirror dashboard modal checkbox UX. Zero typo risk + explicit state.
+    // mutasi_enabled gets ON/OFF inline keyboard picker — mirror dashboard
+    // modal checkbox UX. Zero typo risk + explicit state.
     if (fieldKey === 'mutasi_enabled') {
         return handleEditFieldMutasiPick(ctx, active, fieldDef);
     }
@@ -620,8 +605,8 @@ async function handleEditFieldPick(ctx) {
 }
 
 /**
- * Sprint 2e-3: device_id picker. Queries clientapp for live ADB device list,
- * renders InlineKeyboard with 1 button per device. Index-based callback_data
+ * device_id picker. Queries clientapp for live ADB device list, renders
+ * InlineKeyboard with 1 button per device. Index-based callback_data
  * (edit_dev:<idx>) stays well under Telegram's 64-byte cap regardless of serial
  * length. Falls back to text input if no devices online or the query fails.
  */
@@ -693,7 +678,7 @@ async function handleEditFieldDeviceIdPick(ctx, active, fieldDef) {
 }
 
 /**
- * Sprint 2e-3: user clicked a device in the dropdown.
+ * User clicked a device in the dropdown.
  * Resolves the index → serial from wizard.data.devices_cached, then advances
  * to confirm (reuses existing handleEditConfirm path).
  */
@@ -745,7 +730,7 @@ async function handleEditDevicePick(ctx) {
 }
 
 /**
- * Sprint 2e-3: "Type manually" fallback from device-pick keyboard.
+ * "Type manually" fallback from device-pick keyboard.
  * Advances wizard to await_value so user can send free-text serial.
  */
 async function handleEditDeviceManual(ctx) {
@@ -779,7 +764,7 @@ async function handleEditDeviceManual(ctx) {
 }
 
 /**
- * Sprint 3 polish (v4.3.17): mutasi_enabled ON/OFF inline picker.
+ * mutasi_enabled ON/OFF inline picker.
  * Mirror pattern device_id dropdown — explicit state buttons replace free
  * text input. Clientapp DB stores integer 0/1; wizard state carries '1'/'0'
  * string so confirm page can escape + render via maskForDisplay.
@@ -820,7 +805,7 @@ async function handleEditFieldMutasiPick(ctx, active, fieldDef) {
 }
 
 /**
- * Sprint 3 polish (v4.3.17): mutasi_enabled picker click handler.
+ * mutasi_enabled picker click handler.
  * Resolves on/off → '1'/'0' value → advance to confirm.
  */
 async function handleEditMutasiPick(ctx) {
@@ -879,9 +864,9 @@ async function handleEditValueInput(ctx, active) {
         await ctx.reply(`❌ Value too long (${value.length} chars, max 1024).`, { parse_mode: 'HTML' });
         return true;
     }
-    // Sprint 2e-3 (v4.3.9): per-field validation (defense in depth — mirrors /add
-    // validateAddField + REST /account/edit guards). Catches bad input before
-    // scaffold / round-trip call, so user sees inline error immediately.
+    // Per-field validation (defense in depth — mirrors /add validateAddField
+    // + REST /account/edit guards). Catches bad input before the round-trip
+    // call, so user sees inline error immediately.
     if (active.data.field === 'keep_balance') {
         if (!KEEP_BALANCE_REGEX.test(value)) {
             await ctx.reply('❌ Saldo minimal must be a non-negative integer (no decimals, no separators). Send again or /cancel.', { parse_mode: 'HTML' });
@@ -904,11 +889,11 @@ async function handleEditValueInput(ctx, active) {
         }
     }
 
-    // v4.3.13 Sprint 3 polish: auto-delete sensitive input message from chat
-    // history (private chat only — bot has delete rights on user messages
-    // there, not in groups). Wrap in try/catch: non-blocking if message >48h
-    // old or Telegram API transient. Executes AFTER validation pass so operator
-    // doesn't lose their input accidentally on validation retry.
+    // Auto-delete sensitive input message from chat history (private chat only —
+    // bot has delete rights on user messages there, not in groups). Wrap in
+    // try/catch: non-blocking if message >48h old or Telegram API transient.
+    // Executes AFTER validation pass so operator doesn't lose their input
+    // accidentally on validation retry.
     if (SENSITIVE_EDIT_FIELDS.has(active.data.field)) {
         try { await ctx.deleteMessage(); } catch (_) { /* non-blocking */ }
     }
@@ -961,10 +946,10 @@ async function handleEditConfirm(ctx) {
     }
 
     // decision === 'ok' — call backend
-    // F1 Sprint 2c mini-scan fix: atomic CAS transition confirm→applying.
-    // Only the first caller gets affectedRows=1 — a rapid double-click's second callback
-    // gets 'no active wizard' and we no-op, preventing duplicate destructive calls
-    // (critical for Sprint 2e when this triggers real clientapp socket emits).
+    // Atomic CAS lock (double-click guard): transition confirm→applying.
+    // Only the first caller gets affectedRows=1 — a rapid double-click's second
+    // callback gets 'no active wizard' and we no-op, preventing duplicate
+    // destructive calls (critical when this triggers real clientapp socket emits).
     try {
         await advanceWizard(r.chat_id, 'applying', {}, 'confirm');
     } catch (_) {
@@ -1024,7 +1009,7 @@ async function handleEditConfirm(ctx) {
         });
     }
 
-    // F1 fix: release the atomic lock (step='applying' → gone). Cancel is idempotent.
+    // Release the atomic lock (step='applying' → gone). Cancel is idempotent.
     await cancelWizard(r.chat_id);
 }
 
@@ -1040,8 +1025,9 @@ async function handleEditCancelAction(ctx) {
 }
 
 // ==========================================================
-// /add — Sprint 2d-1 (v4.3.6 hotfix: field schema realigned with clientapp)
-// Wizard flow: pick_rdp → ask_alias → ask_password → ask_callback_url → confirm → POST
+// /add
+// Wizard flow: pick_rdp → ask_alias → ask_password → ask_callback_url →
+//              ask_keep_balance → ask_device_ip → ask_pair_code → confirm → POST
 // ==========================================================
 
 async function handleAdd(ctx) {
@@ -1173,11 +1159,11 @@ async function handleAddValueInput(ctx, active) {
         return true;
     }
 
-    // v4.3.13 Sprint 3 polish: auto-delete sensitive input (password, pair_code)
-    // from chat history for security. Executes AFTER validation pass so bad
-    // input doesn't get deleted (operator retry preserves what they typed).
-    // Non-blocking try/catch: Telegram allows bot to delete incoming messages
-    // in private chats but can fail silently if message >48h old / API transient.
+    // Auto-delete sensitive input (password, pair_code) from chat history for
+    // security. Executes AFTER validation pass so bad input doesn't get deleted
+    // (operator retry preserves what they typed). Non-blocking try/catch:
+    // Telegram allows bot to delete incoming messages in private chats but can
+    // fail silently if message >48h old / API transient.
     if (SENSITIVE_ADD_FIELDS.has(stepKey)) {
         try { await ctx.deleteMessage(); } catch (_) { /* non-blocking */ }
     }
@@ -1321,7 +1307,7 @@ async function handleAddCancelAction(ctx) {
 }
 
 // ==========================================================
-// /start + /stop — Sprint 3 (v4.3.10) runtime bot control
+// /start + /stop — runtime bot control
 // ==========================================================
 
 async function handleStart(ctx) { return handleStartStop(ctx, 'start'); }
@@ -1329,8 +1315,6 @@ async function handleStop(ctx)  { return handleStartStop(ctx, 'stop'); }
 
 async function handleStartStop(ctx, action) {
     const r = ctx.state.role;
-    // v4.5.2 (2026-11-27): parseAliasArgs supports quoted alias with space.
-    // Also fix pre-existing Usage text: command is /start_bot (not /start) per index.js:28-29.
     const cmd = `${action}_bot`;
     const { alias, rdp_hostname: rdpArg } = parseAliasArgs(ctx.message?.text);
     if (!alias) {
@@ -1372,9 +1356,9 @@ async function handleStartStop(ctx, action) {
 
 async function startStopExecute(ctx, action, alias, rdp_hostname) {
     const r = ctx.state.role;
-    // Direct execute — no confirm step per D3=C1 (operator-tempo freq ops).
-    // Clientapp side: up to 15s wait for bot-started/-start-failed event (start),
-    // or immediate ack after engine.stop() flip (stop). Backend timeout 20s.
+    // Direct execute — no confirm step (operator-tempo freq ops). Clientapp
+    // side: up to 15s wait for bot-started/-start-failed event (start), or
+    // immediate ack after engine.stop() flip (stop). Backend timeout 20s.
     const typingMsg = await ctx.reply(action === 'start' ? '🟡 Starting bot...' : '🟡 Stopping bot...', { parse_mode: 'HTML' });
     const resp = await postJson(`/bot/${action}`, { alias, rdp_hostname, operator_chat_id: r.chat_id });
 
@@ -1427,7 +1411,7 @@ async function startStopExecute(ctx, action, alias, rdp_hostname) {
 }
 
 // ==========================================================
-// Alias-picker callback — Sprint 3 (v4.3.10)
+// Alias-picker callback
 // Shared across /start /stop /edit /delete when alias resolves to multi-RDP.
 // callback_data format: pick_rdp:<cbid>:<idx>|cancel
 // ==========================================================
@@ -1460,8 +1444,8 @@ async function handlePickRdp(ctx) {
     const idx = parseInt(idxOrCancel, 10);
     const candidate = pending.candidates?.[idx];
     if (!candidate) {
-        // Mini-scan G3 fix: drop pending entry on invalid idx to prevent zombie
-        // state (unreachable under current regex but defense-in-depth).
+        // Drop pending entry on invalid idx to prevent zombie state
+        // (unreachable under current regex but defense-in-depth).
         pendingPickers.delete(cbid);
         await ctx.answerCbQuery('❌ Invalid choice.', { show_alert: true });
         return;
@@ -1492,7 +1476,7 @@ async function handlePickRdp(ctx) {
 }
 
 // ==========================================================
-// /list_accounts — Sprint 3 polish (v4.3.14)
+// /list_accounts
 // Fan-out ke semua RDP di operator scope, aggregate per RDP, kirim HTML
 // dengan chunked message split kalau total render > ~3500 chars (Telegram
 // per-message cap 4096, buffer 500 untuk safety + header/footer append).
@@ -1515,9 +1499,9 @@ function renderAccountLine(acc) {
     if (acc.mirror_enabled) flags.push('📺 Mirror');
     const flagsStr = flags.length ? flags.join(' • ') : '—';
     const remoteIpLine = acc.remote_ip ? `\n     Remote IP: <code>${escapeHtml(acc.remote_ip)}</code>` : '';
-    // Sprint 3 polish (v4.3.15): saldo minimal removed from aggregated view
-    // per user request. Operator access via /edit <alias> → pick "Saldo Minimal"
-    // field tetap tampil current value.
+    // Saldo minimal intentionally omitted from the aggregated view (operator
+    // access via /edit <alias> → pick "Saldo Minimal" field tetap tampil
+    // current value).
     return [
         `  ${stateEmoji} <b>${escapeHtml(acc.alias)}</b>`,
         `     Device: <code>${escapeHtml(device)}</code>${remoteIpLine}`,
@@ -1557,9 +1541,9 @@ async function handleListAccounts(ctx) {
         return;
     }
 
-    // Build messages — per-account line iteration (mini-scan G1 fix: single
-    // large RDP group was treated as atomic blob → could exceed 4096 Telegram
-    // cap). Now flush per-line when buf would overflow; continuation header
+    // Build messages — per-account line iteration. Earlier revision treated
+    // a single large RDP group as one atomic blob → could exceed 4096 Telegram
+    // cap. Now flush per-line when buf would overflow; continuation header
     // ("(cont.)") inserted so operator sees RDP context preserved across split.
     const header = `📋 <b>Accounts Overview</b>`;
     const footer = `📊 ${totals.scanned} RDP scanned, ${totals.responded} responded. ${totals.accounts} account(s): ${totals.running} running, ${totals.stopped} stopped.`;

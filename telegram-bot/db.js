@@ -1,6 +1,6 @@
 // Telegram Bot — DB Pool (reuse backend DB_* env)
-// Sprint 1: shared .env at /var/automate/auto_transfer/.env
-// Pool separate from unified-backend process (own connection pool, same DB)
+// Shared .env at /var/automate/auto_transfer/.env.
+// Pool separate from unified-backend process (own connection pool, same DB).
 
 const mysql = require('mysql2/promise');
 

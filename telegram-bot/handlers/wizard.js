@@ -1,6 +1,5 @@
 // Telegram Bot — Wizard Handlers
-// Sprint 2a (2026-11-22): /cancel + text router scaffold
-// Sprint 2c+: /delete, /edit, /add handlers will register step callbacks here
+// /cancel + text router (dispatches to step handlers in operator.js)
 
 const { getActiveWizard, cancelWizard } = require('../wizard');
 const { logAudit } = require('../audit');
@@ -26,32 +25,32 @@ async function handleCancel(ctx) {
 }
 
 /**
- * Sprint 2a: router stub. Sprint 2c: dispatch to /edit await_value step.
+ * Dispatch non-command text to the active wizard step handler.
  * Returns true if the message was handled by a wizard step, false otherwise.
  */
 async function routeWizardText(ctx) {
     const r = ctx.state.role;
     if (!r?.chat_id) return false;
-    // F3 mini-scan Sprint 2a fix: gate on role — only owner/operator can own wizard.
-    // Prevents leaking wizard_type/step info to revoked/unknown users whose wizard row
-    // may still exist in DB before cascade cleanup.
+    // Gate on role — only owner/operator can own wizard. Prevents leaking
+    // wizard_type/step info to revoked/unknown users whose wizard row may still
+    // exist in DB before cascade cleanup.
     if (r.role !== 'owner' && r.role !== 'operator') return false;
     const active = await getActiveWizard(r.chat_id);
     if (!active) return false;
 
-    // Sprint 2c: /edit wizard await_value step
+    // /edit wizard await_value step
     if (active.wizard_type === 'edit' && active.step === 'await_value') {
         const { handleEditValueInput } = require('./operator');
         return await handleEditValueInput(ctx, active);
     }
 
-    // Sprint 2d-1: /add wizard ask_<field> steps
+    // /add wizard ask_<field> steps
     if (active.wizard_type === 'add' && typeof active.step === 'string' && active.step.startsWith('ask_')) {
         const { handleAddValueInput } = require('./operator');
         return await handleAddValueInput(ctx, active);
     }
 
-    // Unknown wizard/step — stub reply for future sprints
+    // Unknown wizard/step — stub reply
     await ctx.reply(
         `⏳ Wizard <code>${escapeHtml(active.wizard_type)}</code> step <code>${escapeHtml(active.step)}</code> — handler not implemented yet.\n\nUse <code>/cancel</code> to exit.`,
         { parse_mode: 'HTML' }

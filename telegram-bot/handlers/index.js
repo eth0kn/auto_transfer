@@ -24,38 +24,37 @@ function registerHandlers(bot) {
     bot.command('delete', requireRole(['owner', 'operator']), op.handleDelete);
     bot.command('edit',   requireRole(['owner', 'operator']), op.handleEdit);
     bot.command('add',    requireRole(['owner', 'operator']), op.handleAdd);
-    // Sprint 3 (v4.3.10): runtime bot control + alias-only args retrofit
+    // Runtime bot control + alias-only args
     bot.command('start_bot', requireRole(['owner', 'operator']), op.handleStart);
     bot.command('stop_bot',  requireRole(['owner', 'operator']), op.handleStop);
-    // Sprint 3 polish (v4.3.14): aggregated accounts view across operator scope
+    // Aggregated accounts view across operator scope
     bot.command('list_accounts', requireRole(['owner', 'operator']), op.handleListAccounts);
 
-    // Sprint 2b: inline-button callbacks for /delete confirm flow
+    // Inline-button callbacks for /delete confirm flow
     // Pattern: del_ok:<cbid> and del_no:<cbid>, cbid = 12 hex chars
     bot.action(/^del_ok:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteConfirm);
     bot.action(/^del_no:([0-9a-f]{12})$/, requireRole(['owner', 'operator']), op.handleDeleteCancel);
 
-    // Sprint 2c + v4.3.6 hotfix: /edit wizard inline-button callbacks
-    // v4.3.9 / Sprint 2e-3 (2026-11-22): remote_ip dropped (auto-derived at clientapp),
-    // keep_balance added (numeric "Saldo Minimal"). device_id picker uses edit_dev:<idx>
-    // from a per-wizard cached device list (max 20) — index-based so callback_data
-    // stays tiny regardless of serial length.
+    // /edit wizard inline-button callbacks. Field whitelist aligned with clientapp schema:
+    // 6 fields (alias, password, callback_url, device_id, keep_balance, mutasi_enabled).
+    // device_id picker uses edit_dev:<idx> from a per-wizard cached device list (max 20)
+    // — index-based so callback_data stays tiny regardless of serial length.
     bot.action(/^edit_field:(alias|password|callback_url|device_id|keep_balance|mutasi_enabled)$/, requireRole(['owner', 'operator']), op.handleEditFieldPick);
     bot.action(/^edit_dev:(\d{1,2})$/, requireRole(['owner', 'operator']), op.handleEditDevicePick);
     bot.action(/^edit_dev_manual$/, requireRole(['owner', 'operator']), op.handleEditDeviceManual);
-    // Sprint 3 polish (v4.3.17): mutasi_enabled picker — ON/OFF static buttons
+    // mutasi_enabled picker — ON/OFF static buttons
     bot.action(/^edit_mutasi:(on|off)$/, requireRole(['owner', 'operator']), op.handleEditMutasiPick);
     bot.action(/^edit_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleEditConfirm);
     bot.action(/^edit_cancel$/, requireRole(['owner', 'operator']), op.handleEditCancelAction);
 
-    // Sprint 2d-1 + v4.3.6 hotfix: /add wizard inline-button callbacks
+    // /add wizard inline-button callbacks.
     // add_rdp:<hostname> — accept any non-control char (spaces + case + special — Windows hostname
-    // naming is loose at clientapp registration; backend re-validates scope at click time.
+    // naming is loose at clientapp registration; backend re-validates scope at click time).
     bot.action(/^add_rdp:([^\x00-\x1F\x7F]{1,55})$/, requireRole(['owner', 'operator']), op.handleAddRdpPick);
     bot.action(/^add_confirm:(ok|no)$/, requireRole(['owner', 'operator']), op.handleAddConfirm);
     bot.action(/^add_cancel$/, requireRole(['owner', 'operator']), op.handleAddCancelAction);
 
-    // Sprint 3 (v4.3.10): alias→RDP picker for /start /stop /edit /delete without rdp_hostname.
+    // alias→RDP picker for /start /stop /edit /delete without rdp_hostname.
     // callback_data: pick_rdp:<cbid=12hex>:<idx=0-9|cancel>
     bot.action(/^pick_rdp:([0-9a-f]{12}):(\d|cancel)$/, requireRole(['owner', 'operator']), op.handlePickRdp);
 
@@ -91,7 +90,7 @@ function registerHandlers(bot) {
         const handled = await wiz.routeWizardText(ctx);
         if (handled) return;
 
-        // No wizard active + non-command — silent ignore (Sprint 1 behavior preserved)
+        // No wizard active + non-command — silent ignore
     });
 }
 

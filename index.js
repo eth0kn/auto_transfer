@@ -18,11 +18,10 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 
-// v4.1.0 (2026-11-01): Transfer Status Callback feature.
-// Spec: docs/feature-callback-2026-11-01.md
+// Transfer Status Callback feature (callback-worker + validateCallbackUrl).
 const callbackWorker = require('./callback-worker');
 const { validateCallbackUrl, validateSecret } = require('./callback-security');
-const bcrypt = require('bcrypt'); // v4.1.5 (2026-11-21): multi-user dashboard auth via DB + bcrypt
+const bcrypt = require('bcrypt'); // multi-user dashboard auth via DB + bcrypt
 const BCRYPT_COST = 10;
 
 // ==========================================================
@@ -31,26 +30,26 @@ const BCRYPT_COST = 10;
 const APP_SOURCES = ['brimo', 'mybca', 'seabank'];
 const PORT = parseInt(process.env.PORT) || 3010;
 const VALIDATION_TIMEOUT_MS = parseInt(process.env.VALIDATION_TIMEOUT_MS) || 60000;
-// v4.0.1 M2 (2026-11-01): raised from 180s → 300s. 180s was too tight untuk slow
-// network transfer saat scale 150 trx / 30 bots serial — causes SUCCESS stamp onto
-// FAILED row race. 300s = 5min safety window, still catches true stuck/crashed bot.
+// PROCESSING_STALE_MS 300s (5min) safety window — catches true stuck/crashed bot
+// without false-positive on slow network transfer during scale (e.g. 150 trx /
+// 30 bots serial), which caused SUCCESS stamp onto FAILED row race at 180s.
 const PROCESSING_STALE_MS = parseInt(process.env.PROCESSING_STALE_MS) || 300000;
-// v4.1.2 (2026-11-03): raised from 10m → 2h. 10m was too tight saat antrian padat —
-// legit PENDING tasks di-cancel sebelum bot sempat ambil, meskipun bot online. 2h =
-// safety window besar untuk serial dispatcher ACK-P2 queue tanpa false-positive cancel.
-// Independen dari PROCESSING_STALE_MS (bot crash while running) + VALIDATION_TIMEOUT_MS
-// (bot validation step) + DISPATCH_ACK_TIMEOUT_MS (per-alias ACK).
+// PENDING_STALE_MS 2h safety window for serial dispatcher ACK-P2 queue. Earlier
+// 10m value was too tight during busy periods — legit PENDING tasks di-cancel
+// sebelum bot sempat ambil, meskipun bot online. Independen dari
+// PROCESSING_STALE_MS (bot crash while running), VALIDATION_TIMEOUT_MS (bot
+// validation step), dan DISPATCH_ACK_TIMEOUT_MS (per-alias ACK).
 const PENDING_STALE_MS = parseInt(process.env.PENDING_STALE_MS) || 2 * 60 * 60 * 1000; // 2 hours
-// v4.0.0 ACK-P2 (2026-10-31): per-alias dispatcher back-pressure.
-// Backend emits task:new ONE AT A TIME per bot alias; next emit waits for ACK.
-// Prevents 10-task burst → 10-ACK-same-timestamp → PROCESSING_STALE_MS false timeout.
-const DISPATCH_ACK_TIMEOUT_MS = parseInt(process.env.DISPATCH_ACK_TIMEOUT_MS) || 60000; // Q1 A1: 60s
+// Per-alias dispatcher back-pressure (ACK-P2): backend emits task:new ONE AT A
+// TIME per bot alias; next emit waits for ACK. Prevents 10-task burst →
+// 10-ACK-same-timestamp → PROCESSING_STALE_MS false timeout.
+const DISPATCH_ACK_TIMEOUT_MS = parseInt(process.env.DISPATCH_ACK_TIMEOUT_MS) || 60000;
 const LEGACY_UNPREFIXED = process.env.LEGACY_UNPREFIXED_ROUTES === 'true';
-// v4.1.0 (2026-11-01): admin key for callback admin endpoints (stats/dead/replay).
-// Required only for callback admin operations. If unset, admin endpoints 503.
+// Admin key for callback admin endpoints (stats/dead/replay). Required only for
+// callback admin operations — if unset, admin endpoints return 503.
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || null;
-// OBS (2026-10-31): observability bundle toggle. Set `OBS_VERBOSE=1` di env (ecosystem.config.js)
-// untuk enable verbose logging race investigation. Default OFF di prod. Zero behavior change.
+// Observability bundle toggle. Set `OBS_VERBOSE=1` di env (ecosystem.config.js)
+// untuk enable verbose logging race investigation. Default OFF di prod.
 const OBS_VERBOSE = process.env.OBS_VERBOSE === '1' || process.env.OBS_VERBOSE === 'true';
 
 // ==========================================================
@@ -77,12 +76,13 @@ const botSockets = new Map();       // key: `${app_source}:${alias}` → socket
 const validationTimers = new Map(); // key: task_id → setTimeout handle
 const taskOwner = new Map();        // key: task_id → { app, alias }
 
-// Sprint 2e (v4.3.8): control-plane sockets from clientapp main.js (one per clientapp per RDP).
-// Keyed by `${app_source}:${rdp_hostname}` — separate namespace from per-engine botSockets.
-// Receives tg:account_create/edit/delete events from telegram-bot-ipc.js round-trip calls.
+// Control-plane sockets from clientapp main.js (one per clientapp per RDP).
+// Keyed by `${app_source}:${rdp_hostname}` — separate namespace from per-engine
+// botSockets. Receives tg:account_create/edit/delete events from
+// telegram-bot-ipc.js round-trip calls.
 const rdpControlSockets = new Map();
 
-// F1 (2026-10-29): Auto-approve global toggle.
+// Auto-approve global toggle.
 // Loaded from app_config DB on boot (see loadAutoApprovalState).
 // Mutated by /api/auto-approve/{enable,disable} endpoints.
 // Read by /{app}/validate-confirmation handler to short-circuit admin decision.
@@ -107,17 +107,19 @@ function emitToBot(app_source, alias, event, payload) {
         }
         return false;
     }
-    // v4.2.0 M9: passive_mirror socket = clientapp registered utk mirror-only (bot engine tidak running).
-    // Dispatch dilewati — task tetap PENDING sampai bot engine aktif register ulang (non-passive).
+    // passive_mirror socket = clientapp registered utk mirror-only (bot engine
+    // tidak running). Dispatch dilewati — task tetap PENDING sampai bot engine
+    // aktif register ulang (non-passive).
     if (sock.passive_mirror) {
         if (OBS_VERBOSE) {
             console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} FAIL=passive_mirror ts_ms=${Date.now()}`);
         }
         return false;
     }
-    // v4.1.3 Fase 1 (2026-11-04): guard emit ke socket pending-removal (60s grace timeout).
-    // Entry tetap di botSockets selama grace period, tapi emit harus dilewati — socket dead,
-    // task harus wait sampai bot re-register (fresh socket) atau prune tick clear entry.
+    // Guard emit ke socket pending-removal (60s grace timeout). Entry tetap di
+    // botSockets selama grace period, tapi emit harus dilewati — socket dead,
+    // task harus wait sampai bot re-register (fresh socket) atau prune tick
+    // clear entry.
     if (sock.disconnected_at) {
         if (OBS_VERBOSE) {
             console.log(`[OBS-BE] EMIT-TO-BOT key=${app_source}:${alias} event=${event} FAIL=disconnected_pending_removal ts_ms=${Date.now()}`);
@@ -132,7 +134,7 @@ function emitToBot(app_source, alias, event, payload) {
 }
 
 // ==========================================================
-// v4.0.0 ACK-P2: SERIAL DISPATCHER PER-ALIAS
+// SERIAL DISPATCHER PER-ALIAS
 // ==========================================================
 // Problem solved: previously backend fired all PENDING tasks in a for-loop
 // (bot:register backlog) → bot ACKs 10× instantly on-receive → backend set
@@ -141,14 +143,13 @@ function emitToBot(app_source, alias, event, payload) {
 //
 // New model: dispatcher per-alias is single-slot. Only emit task:new when
 // slot free; next emit happens after task:ack received (slot freed).
-// Combined with ACK-P1 bot-side (ACK at dequeue, not receive), the backend
+// Combined with ACK-at-dequeue bot-side (not ACK-on-receive), the backend
 // updated_at anchor reflects REAL processing start.
 //
-// Recovery (Q2 B1): if no ACK within DISPATCH_ACK_TIMEOUT_MS, assume stuck
-// (bot crash / socket drop); free slot + pull next PENDING. Task row stays
-// PENDING (never transitioned PROCESSING at DB) → safe re-dispatch.
-// If late ACK arrives, UPDATE WHERE status='PENDING' guard prevents double-
-// transition.
+// Recovery: if no ACK within DISPATCH_ACK_TIMEOUT_MS, assume stuck (bot crash
+// / socket drop); free slot + pull next PENDING. Task row stays PENDING (never
+// transitioned PROCESSING at DB) → safe re-dispatch. If late ACK arrives,
+// UPDATE WHERE status='PENDING' guard prevents double-transition.
 //
 // Scope: all app_sources (brimo, mybca, seabank) use same dispatcher.
 // Key: `${app_source}:${alias}` isolates per-bot state.
@@ -167,12 +168,12 @@ function clearDispatcherState(appSource, alias) {
     const key = dispatcherKey(appSource, alias);
     const d = dispatchers.get(key);
     if (!d) return;
-    // v4.0.2 W3/V2-F8 (2026-11-01): preserve in-flight __RESERVED__ reservations.
-    // Only pullAndDispatchNext owns __RESERVED__ state (reserved sync before DB SELECT).
-    // Self-managed cleanup via its own error/success paths. External clearers (ACK handler
-    // freeDispatcherAndPullNext, bot:disconnect, bot:unregister, markDispatched defensive
-    // clear) MUST NOT wipe reservations — would allow concurrent pullAndDispatchNext to
-    // overwrite + double-emit same oldest PENDING.
+    // Preserve in-flight __RESERVED__ reservations. Only pullAndDispatchNext
+    // owns __RESERVED__ state (reserved sync before DB SELECT). Self-managed
+    // cleanup via its own error/success paths. External clearers (ACK handler
+    // freeDispatcherAndPullNext, bot:disconnect, bot:unregister, markDispatched
+    // defensive clear) MUST NOT wipe reservations — would allow concurrent
+    // pullAndDispatchNext to overwrite + double-emit same oldest PENDING.
     if (d.busyWithTaskId === '__RESERVED__') {
         console.log(`[${appSource}] [DISPATCHER] clear skipped for ${alias} — __RESERVED__ in flight (preserving concurrent reservation)`);
         return;
@@ -198,9 +199,9 @@ async function pullAndDispatchNext(appSource, alias) {
     if (!isDispatcherFree(appSource, alias)) {
         return null;
     }
-    // v4.0.1 F3 (2026-11-01): reserve dispatcher slot SYNCHRONOUSLY before DB await,
-    // so concurrent callers see isDispatcherFree=false. Prevents double-emit race
-    // where 2 simultaneous POST /transfer both pass free-check + both SELECT same
+    // Reserve dispatcher slot SYNCHRONOUSLY before DB await, so concurrent
+    // callers see isDispatcherFree=false. Prevents double-emit race where 2
+    // simultaneous POST /transfer both pass free-check + both SELECT same
     // oldest PENDING → bot receives duplicate task:new (bot dedup catches, but
     // defeats serial contract + wastes socket I/O).
     const _resKey = dispatcherKey(appSource, alias);
@@ -244,9 +245,9 @@ async function pullAndDispatchNext(appSource, alias) {
     }
 }
 
-// Q2 B1 recovery: on ACK timeout, free dispatcher + attempt re-dispatch.
-// Task row stays PENDING (never transitioned PROCESSING yet). Next pull picks it up.
-// If late ACK arrives, UPDATE WHERE status='PENDING' guard still works (safe).
+// On ACK timeout, free dispatcher + attempt re-dispatch. Task row stays PENDING
+// (never transitioned PROCESSING yet). Next pull picks it up. If late ACK
+// arrives, UPDATE WHERE status='PENDING' guard still works (safe).
 async function handleAckTimeout(appSource, alias, taskId) {
     console.warn(`[${appSource}] [ACK TIMEOUT ${DISPATCH_ACK_TIMEOUT_MS/1000}s] task ${taskId} alias ${alias} — reset dispatcher + re-dispatch`);
     clearDispatcherState(appSource, alias);
@@ -295,8 +296,8 @@ function requireApiKey(app_source) {
     };
 }
 
-// v4.1.0 (2026-11-01): guard admin callback endpoints with X-Admin-Key.
-// If ADMIN_API_KEY unset in env, admin endpoints return 503 (feature not configured).
+// Guard admin callback endpoints with X-Admin-Key. If ADMIN_API_KEY unset in
+// env, admin endpoints return 503 (feature not configured).
 function requireAdminKey(req, res, next) {
     if (!ADMIN_API_KEY) {
         return res.status(503).json({ error: 'ADMIN_API_KEY not configured in env' });
@@ -308,9 +309,9 @@ function requireAdminKey(req, res, next) {
     next();
 }
 
-// F1 (2026-10-29): load auto_approve_enabled from app_config DB.
-// Called once at server boot; also safe to re-invoke if ever needed.
-// Fails safe: if DB read errors, flag stays false (default disabled).
+// Load auto_approve_enabled from app_config DB. Called once at server boot;
+// safe to re-invoke if ever needed. Fails safe: if DB read errors, flag stays
+// false (default disabled).
 async function loadAutoApprovalState() {
     try {
         const [rows] = await pool.query(
@@ -338,7 +339,7 @@ function createBotRouter(app_source) {
                 return res.status(400).json({ success: false, msg: 'Data wajib diisi' });
             }
 
-            // v4.1.0 (2026-11-01): optional callback_url + callback_secret.
+            // Optional callback_url + callback_secret.
             // SSRF guard: reject at create-time, task NOT created on bad URL.
             let cbUrl = null, cbSecret = null, cbStatus = 'NONE';
             if (callback_url) {
@@ -365,7 +366,7 @@ function createBotRouter(app_source) {
                  cbUrl, cbSecret, cbStatus]
             );
 
-            // v4.0.0 ACK-P2: route through serial dispatcher (D1 scope — all emit paths).
+            // Route through serial dispatcher — all emit paths go through it.
             // If dispatcher free for this alias → emit immediately. If busy → task stays
             // PENDING, picked up when current task ACKs (freeDispatcherAndPullNext).
             if (isDispatcherFree(app_source, alias)) {
@@ -389,7 +390,7 @@ function createBotRouter(app_source) {
                 bank_type: bank || 'BRI',
                 dest,
                 amount: parseFloat(amount),
-                status: 'PENDING',  // v4.0.1 F1 (2026-11-01): removed broken `dispatched ?` ternary (var was deleted in ACK-P2 refactor, caused ReferenceError → every POST /transfer 500)
+                status: 'PENDING',
                 created_at: new Date().toISOString()
             });
 
@@ -425,11 +426,11 @@ function createBotRouter(app_source) {
             const finalMessage = msgObj?.text || msgObj?.reason || '';
             const refNumber = msgObj?.ref_number || null;
 
-            // v4.1.0 (2026-11-01): validate balance_after + balance_source from clientapp.
-            // Accept null safely; reject garbage via server-side enum guard before DB enum throws.
-            // G1 MED-2 (2026-11-02): add n>=0 guard. Backend authoritative, mirror the
-            // >=0 invariant clientapps already enforce in F3 compute path. Prevents a
-            // future/custom clientapp from storing nonsense negative value in BIGINT col.
+            // Validate balance_after + balance_source from clientapp. Accept null
+            // safely; reject garbage via server-side enum guard before DB enum throws.
+            // The n>=0 guard keeps backend authoritative, mirroring the invariant
+            // clientapps already enforce in their compute path. Prevents a future /
+            // custom clientapp from storing a negative value in the BIGINT column.
             const VALID_BALANCE_SOURCES = ['SCRAPED', 'COMPUTED', 'UNAVAILABLE'];
             const normalizedBalanceAfter = (() => {
                 if (balance_after == null) return null;
@@ -441,8 +442,8 @@ function createBotRouter(app_source) {
                     ? String(balance_source).toUpperCase()
                     : null;
 
-            // v4.0.1 M1/S1 cross-fix (2026-11-01): capture bot_alias for dispatcher free call.
-            // v4.1.0: also capture callback_url to decide callback_status transition.
+            // Capture bot_alias for dispatcher free call + callback_url to decide
+            // callback_status transition.
             const [rows] = await pool.execute(
                 `SELECT bot_alias, callback_url FROM transfer_request WHERE id = ? AND app_source = ?`,
                 [task_id, app_source]
@@ -450,18 +451,17 @@ function createBotRouter(app_source) {
             const bot_alias = rows[0]?.bot_alias;
             const hasCallback = !!rows[0]?.callback_url;
 
-            // v4.0.2 W2+W6/V2-F10 (2026-11-01): UPDATE guard WHERE status IN ('PENDING', 'PROCESSING').
-            // W2 original: WHERE status='PROCESSING' — but blocked reject-path flow (bot rejects
-            // immediately at onTaskNew, never ACKs → status stays PENDING → W2 UPDATE fails →
-            // dispatcher stuck 60s → infinite retry loop). W6 revision: allow transition from
-            // EITHER non-terminal state. Only blocks genuine duplicate reports where status
-            // already terminal (SUCCESS/FAILED). Parity concept dengan F4 (prevent double-free)
-            // tapi preserve M1/S1 cross-fix untuk reject-path.
+            // UPDATE guard WHERE status IN ('PENDING', 'PROCESSING') allows
+            // transition from EITHER non-terminal state. Earlier variant guarded
+            // only 'PROCESSING' — but reject-path (bot rejects at onTaskNew, never
+            // ACKs → status stays PENDING) then stuck the dispatcher 60s in an
+            // infinite retry loop. Only blocks genuine duplicate reports where
+            // status is already terminal (SUCCESS/FAILED).
             //
-            // v4.1.0 (2026-11-01): atomic update extend — balance_after, balance_source, +
-            // conditional callback_status transition NONE→PENDING kalau callback_url present.
-            // Transactional outbox pattern (spec §6b): status finalize + callback enqueue
-            // in ONE statement, zero race window.
+            // Atomic update extends to balance_after, balance_source, + conditional
+            // callback_status transition NONE→PENDING kalau callback_url present
+            // (transactional outbox pattern: status finalize + callback enqueue in
+            // ONE statement, zero race window).
             const [updResult] = await pool.execute(
                 `UPDATE transfer_request SET
                    status = ?,
@@ -491,15 +491,16 @@ function createBotRouter(app_source) {
             io.emit('task_completed', { task_id, status, app_source });
             console.log(`[${app_source}] [REPORT] Task ${task_id} -> ${status}`);
 
-            // v4.0.2 W1/V2-F7 (2026-11-01): CRITICAL regression fix.
-            // Pre-fix v4.0.1 M1/S1 cross-fix unconditionally called freeDispatcher di setiap
-            // /update-task → di happy path (ACK → emit next → result arrives late) →
-            // dispatcher sudah busy dengan NEXT task → unconditional free wipes NEXT task
-            // state → re-emits NEXT task → bot dedup catches tapi serial contract broken.
+            // Gate freeDispatcher on dispatcher.busyWithTaskId === task_id — only
+            // free kalau dispatcher ACTUALLY busy dengan task INI. Happy path: busy
+            // with NEXT ≠ this task → NO-OP. Reject path: busy with rejected task
+            // === this task → free + pull next.
             //
-            // Fix: Gate on dispatcher.busyWithTaskId === task_id. Only free kalau dispatcher
-            // ACTUALLY busy dengan task INI. Happy path: busy with NEXT ≠ this task → NO-OP.
-            // Reject path: busy with rejected task === this task → free + pull next (M1/S1 preserved).
+            // Earlier revision unconditionally called freeDispatcher di setiap
+            // /update-task. Di happy path (ACK → emit next → result arrives late)
+            // the dispatcher was already busy with NEXT task, so the unconditional
+            // free wiped NEXT task state → re-emits NEXT task → bot dedup catches
+            // tapi serial contract broken.
             if (bot_alias) {
                 const _dstate = dispatchers.get(dispatcherKey(app_source, bot_alias));
                 if (_dstate && _dstate.busyWithTaskId === task_id) {
@@ -512,8 +513,8 @@ function createBotRouter(app_source) {
 
             res.json({ success: true });
 
-            // v4.1.0 (2026-11-01): fire-and-forget — signal callback worker to pick up this
-            // newly-enqueued delivery immediately (optional; worker tick 10s also picks it up).
+            // Fire-and-forget: signal callback worker to pick up this newly-enqueued
+            // delivery immediately (optional; worker tick 10s also picks it up).
             // Must be AFTER res.json so client is not blocked waiting callback dispatch.
             if (hasCallback) {
                 callbackWorker.signalPickup();
@@ -531,11 +532,12 @@ function createBotRouter(app_source) {
             const d = req.body;
             obsLog('VC-ENTRY', { app: app_source, task_id: d && d.task_id, device: d && d.device_id, amount: d && d.total_amount });
 
-            // R8 (2026-10-30): Transaction wrapper INSERT WAITING + conditional UPDATE PROCEED.
-            // Pre-fix: 2 separate pool.execute() — kalau MySQL crash atau connection drop
-            // antara INSERT & UPDATE di auto-approve path, bisa partial state (stuck WAITING).
-            // Scope transaction: INSERT + SELECT reqData + conditional UPDATE (auto-approve only).
-            // Emit socket moved OUTSIDE transaction (post-commit) karena side-effect non-DB.
+            // Transaction wrapper: INSERT WAITING + conditional UPDATE PROCEED.
+            // Earlier revision used 2 separate pool.execute() — kalau MySQL crash
+            // atau connection drop antara INSERT & UPDATE di auto-approve path, bisa
+            // partial state (stuck WAITING). Scope: INSERT + SELECT reqData +
+            // conditional UPDATE (auto-approve only). Emit socket moved OUTSIDE
+            // transaction (post-commit) karena side-effect non-DB.
             const conn = await pool.getConnection();
             let reqData;
             let autoApproved = false;
@@ -577,20 +579,20 @@ function createBotRouter(app_source) {
             }
             obsLog('VC-TX-COMMIT', { app: app_source, task_id: d.task_id, autoApproved, tx_duration_ms: Date.now() - _obsStart });
 
-            // F1 (2026-10-29): Auto-approve short-circuit.
+            // Auto-approve short-circuit.
             // If global toggle ON: immediately mark PROCEED + emit decision to bot + emit
             // decision_updated to dashboard, and SKIP timeout registration. Bot gets its
             // decision in <500ms instead of waiting for admin or 60s timeout.
             if (autoApproved) {
                 console.log(`✅ [${app_source}] [auto-approve] PROCEED ${d.task_id}`);
-                // v3.8.2 (2026-10-30): Defer socket emit via setImmediate — fix race
-                // dimana bot engine axios.post /validate-confirmation BELUM resolve saat
-                // backend sync-emit decision. Bot setup `pendingDecisions` resolver
-                // SETELAH axios resolve, jadi kalau emit sync, event drop → bot stuck
-                // wait → 180s stale cleanup FAILED. Dengan setImmediate, emit terjadi
-                // SETELAH HTTP response terserialize → bot resolver ready saat terima.
-                // Admin flow (toggle OFF) aman karena ada delay admin-click (detik-ke-menit)
-                // sudah >> race window.
+                // Defer socket emit via setImmediate — fix race where bot engine
+                // axios.post /validate-confirmation BELUM resolve saat backend
+                // sync-emit decision. Bot sets up `pendingDecisions` resolver
+                // SETELAH axios resolves, jadi kalau emit sync, event drop → bot
+                // stuck wait → 180s stale cleanup FAILED. Dengan setImmediate,
+                // emit terjadi SETELAH HTTP response terserialize → bot resolver
+                // ready saat terima. Admin flow (toggle OFF) aman karena ada delay
+                // admin-click (detik-ke-menit) sudah >> race window.
                 const owner = taskOwner.get(d.task_id);
                 obsLog('VC-SI-SCHEDULE', { app: app_source, task_id: d.task_id, owner_alias: owner && owner.alias || 'null' });
                 const _siScheduledAt = Date.now();
@@ -631,7 +633,7 @@ function createBotRouter(app_source) {
                 const timer = setTimeout(async () => {
                     console.log(`⏰ [${app_source}] Validation timeout: ${d.task_id}`);
                     try {
-                        // F1 (2026-10-29): persist decision_source='TIMEOUT' for audit
+                        // Persist decision_source='TIMEOUT' for audit
                         await pool.execute(
                             `UPDATE transfer_validations SET status = 'ABORT', decision_source = 'TIMEOUT'
                              WHERE task_id = ? AND status = 'WAITING'`,
@@ -670,10 +672,10 @@ function createBotRouter(app_source) {
             const { task_id, status } = req.body;
             const msg = req.body.message || 'Rejected by Admin';
 
-            // R3 (2026-10-30): Detect bot internal timeout vs real admin action.
-            // Pre-fix: all prefixed POSTs tagged ADMIN. Bot timeout path (engine/bot.js) POSTs
-            // { message: 'timeout auto rejected' } — mis-labeled as admin in DB audit.
-            // Accept explicit source field (future bot change) or fallback regex on message text.
+            // Detect bot internal timeout vs real admin action. Earlier revision
+            // tagged all prefixed POSTs as ADMIN — bot timeout path (engine/bot.js)
+            // POSTs { message: 'timeout auto rejected' } was mis-labeled as admin
+            // in DB audit. Accept explicit source field OR fallback regex on message text.
             const rawSource = (req.body.source || '').toUpperCase();
             const isBotTimeout = rawSource === 'TIMEOUT' || /timeout/i.test(msg);
             const decisionSource = isBotTimeout ? 'TIMEOUT' : 'ADMIN';
@@ -712,9 +714,10 @@ function createBotRouter(app_source) {
         }
     });
 
-    // F2 (2026-10-29): Transfer status endpoint — external client polling by task_id.
-    // Auth mirrors /transfer (X-API-KEY). Returns rich response with derived client-facing
-    // status (combination of transfer_request.status + transfer_validations.status).
+    // Transfer status endpoint — external client polling by task_id.
+    // Auth mirrors /transfer (X-API-KEY). Returns rich response with derived
+    // client-facing status (combination of transfer_request.status +
+    // transfer_validations.status).
     r.get('/transfer-status/:task_id', requireApiKey(app_source), async (req, res) => {
         const { task_id } = req.params;
         // Format validation — TRX- prefix + 8 hex (uppercase)
@@ -788,10 +791,10 @@ app.post('/update-decision', requireAuth, async (req, res) => {
         const { task_id, status } = req.body;
         const msg = req.body.message || 'Rejected by Admin';
 
-        // R6 (2026-10-30): Admin reject gate saat auto-approve ON.
-        // Prevent admin dari click REJECT when global auto-approve is active —
-        // policy per 2026-10-30: admin tidak bisa override auto-approve policy.
-        // Approve (PROCEED) tetap allowed sebagai manual override backup.
+        // Admin reject gate saat auto-approve ON. Prevent admin dari click
+        // REJECT when global auto-approve is active — policy decision: admin
+        // tidak bisa override auto-approve policy. Approve (PROCEED) tetap
+        // allowed sebagai manual override backup.
         if (autoApprovalEnabled && status === 'ABORT') {
             return res.status(403).json({
                 error: 'Admin reject disabled while auto-approve is ON',
@@ -809,7 +812,7 @@ app.post('/update-decision', requireAuth, async (req, res) => {
             return res.status(404).json({ error: 'validation not found' });
         }
 
-        // F1 (2026-10-29): persist decision_source='ADMIN' for audit
+        // Persist decision_source='ADMIN' for audit
         await pool.execute(
             "UPDATE transfer_validations SET status = ?, decision_source = 'ADMIN' WHERE task_id = ?",
             [status, task_id]
@@ -1034,9 +1037,9 @@ app.get('/api/bots', requireAuth, (req, res) => {
             device_id: sock.device_id || null,
             bot_id: sock.bot_id || null,
             connected_at: sock.connected_at || null,
-            // v4.1.3 Fase 1 (2026-11-04): reflect actual state (hardcoded true would lie
-            // during 60s grace window after disconnect — mirror hub would show "online"
-            // for cards that are actually dead but still in registry).
+            // Reflect actual state (hardcoded true would lie during 60s grace
+            // window after disconnect — mirror hub would show "online" for cards
+            // that are actually dead but still in registry).
             online: !sock.disconnected_at && sock.connected !== false
         });
     }
@@ -1044,16 +1047,14 @@ app.get('/api/bots', requireAuth, (req, res) => {
     res.json(bots);
 });
 
-// v4.3.2 Sprint 2b (2026-11-22): Telegram Bot IPC — loopback + Bearer auth
-// Module at ./telegram-bot-ipc.js; mounted here only to share app + pool.
-// Sprint 2e (v4.3.8): inject control-socket emitter so IPC routes can round-trip.
-// Sprint 2g (v4.3.18, 2026-11-23): also inject rdpControlSockets Map reference
-// for dynamic app_source resolver — `callClientapp` without explicit app_source
-// now auto-picks active clientapp at given RDP.
+// Telegram Bot IPC — loopback + Bearer auth, mounted here to share app + pool.
+// Injected: DB pool, control-socket emitter (for IPC round-trips), the
+// rdpControlSockets Map (for the dynamic app_source resolver — `callClientapp`
+// without explicit app_source auto-picks the active clientapp at a given RDP),
+// and the botSockets Map (for the GET /api/tg/status aggregate).
 const tgIpc = require('./telegram-bot-ipc');
 tgIpc.setDb(pool);
 tgIpc.setControlSocketMap(rdpControlSockets);
-// v4.5.3 (2026-11-27): inject botSockets Map untuk GET /api/tg/status aggregate.
 tgIpc.setBotSocketMap(botSockets);
 tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
     const key = `${app_source}:${rdp_hostname}`;
@@ -1068,8 +1069,9 @@ tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
 });
 app.use('/api/tg', tgIpc.router);
 
-// v4.2.0 M6: GET /api/mirror/devices — device registry untuk mirror-proxy hub
-// Dual auth: cookie isLoggedIn (browser) OR X-Admin-Key header (mirror-proxy machine-to-machine)
+// GET /api/mirror/devices — device registry untuk mirror-proxy hub.
+// Dual auth: cookie isLoggedIn (browser) OR X-Admin-Key header
+// (mirror-proxy machine-to-machine).
 app.get('/api/mirror/devices', (req, res) => {
     const providedKey = req.headers['x-admin-key'];
     const cookieAuth = req.cookies.isLoggedIn === 'true';
@@ -1084,8 +1086,9 @@ app.get('/api/mirror/devices', (req, res) => {
         const app_source = key.substring(0, idx);
         const alias = key.substring(idx + 1);
         if (appFilter !== 'all' && app_source !== appFilter) continue;
-        // v4.3.0 (2026-11-04): filter out explicit mirror_enabled=false — clientapp toggle OFF
-        // di dashboard card means akun tidak mau muncul di hub. Backward compat: undefined/true → show.
+        // Filter out explicit mirror_enabled=false — clientapp toggle OFF di
+        // dashboard card means akun tidak mau muncul di hub. Backward compat:
+        // undefined/true → show.
         if (sock.mirror_enabled === false) continue;
         devices.push({
             alias,
@@ -1093,11 +1096,12 @@ app.get('/api/mirror/devices', (req, res) => {
             device_id: sock.device_id || null,
             rdp_ts_ip: sock.rdp_ts_ip || null,
             rdp_hostname: sock.rdp_hostname || null,
-            passive_mirror: sock.passive_mirror === true, // v4.2.0 M9
-            mirror_enabled: sock.mirror_enabled !== false, // v4.3.0 (explicit untuk observability)
+            passive_mirror: sock.passive_mirror === true,
+            mirror_enabled: sock.mirror_enabled !== false, // explicit untuk observability
             connected_at: sock.connected_at || null,
-            // v4.1.3 Fase 1 (2026-11-04): reflect actual online state (60s grace window
-            // disconnected → online: false, mirror hub UI shows card dgn status accurate).
+            // Reflect actual online state: during 60s grace window the entry is
+            // present tapi disconnected → online: false, mirror hub UI shows
+            // card dgn status accurate.
             online: !sock.disconnected_at && sock.connected !== false
         });
     }
@@ -1113,7 +1117,7 @@ app.get(['/', '/dashboard', '/history'], requireAuth, (req, res) => res.send(get
 app.get('/login', (req, res) => res.send(getLoginUI()));
 
 // ==========================================================
-// TAILSCALE NODE REGISTER (v2.1.0 — added 2026-09-29)
+// TAILSCALE NODE REGISTER
 // UX: admin login dashboard → menu "Tailscale Register" → paste auth-id → submit
 // Backend: exec `sudo docker exec headscale headscale auth register --auth-id X --user kn-fleet`
 // Auth: dashboard session cookie (requireAuth middleware)
@@ -1123,7 +1127,7 @@ const TAILSCALE_AUTH_ID_REGEX = /^hskey-authreq-[a-zA-Z0-9_-]+$/;
 const HEADSCALE_USER = 'kn-fleet';
 const AUTO_ACCEPT_MAX_DURATION_MS = 60 * 60 * 1000; // 1 hour
 
-// v2.2.0: auto-accept state (in-memory, reset on backend restart)
+// Auto-accept state (in-memory, reset on backend restart).
 const autoAcceptState = {
     enabled: false,
     expires_at: null,   // ms epoch
@@ -1170,7 +1174,7 @@ app.post('/tailscale/register', requireAuth, (req, res) => {
     });
 });
 
-// v2.2.0: Auto-accept toggle API
+// Auto-accept toggle API
 app.get('/api/tailscale/auto-accept/status', requireAuth, (req, res) => {
     const now = Date.now();
     const remaining = (autoAcceptState.enabled && autoAcceptState.expires_at)
@@ -1215,7 +1219,7 @@ app.post('/api/tailscale/auto-accept/disable', requireAuth, (req, res) => {
 });
 
 // ==========================================================
-// F1 (2026-10-29): Auto-approve toggle API (global, DB-backed)
+// Auto-approve toggle API (global, DB-backed).
 // Pattern mirrors tailscale auto-accept above — in-memory flag + broadcast,
 // but persisted in `app_config` so flag survives PM2 restart.
 // ==========================================================
@@ -1253,7 +1257,7 @@ app.post('/api/auto-approve/disable', requireAuth, async (req, res) => {
     }
 });
 
-// v2.2.0: Log watcher — tail Headscale docker log, extract new auth-ids
+// Log watcher — tail Headscale docker log, extract new auth-ids.
 const AUTH_ID_LOG_REGEX = /starting node registration using auth id: (hskey-authreq-[a-zA-Z0-9_-]+)/;
 let headscaleLogWatcher = null;
 let logWatcherBuffer = '';
@@ -1315,10 +1319,10 @@ function handleNewAuthId(authId) {
 // Start watcher after server listen (async)
 setTimeout(startHeadscaleLogWatcher, 2000);
 
-// v4.1.5 (2026-11-21): multi-user dashboard auth — DB lookup + bcrypt.compare.
-// Env DASHBOARD_USER/DASHBOARD_PASS tidak lagi di-consume (di-seed ke DB saat
-// migration via scripts/add-user.js). Table dashboard_users dengan password_hash
-// bcrypt cost 10 + soft delete (disabled=1). Timing-attack-resistant via dummy
+// Multi-user dashboard auth — DB lookup + bcrypt.compare. Env
+// DASHBOARD_USER/DASHBOARD_PASS tidak lagi di-consume (di-seed ke DB via
+// scripts/add-user.js). Table dashboard_users dengan password_hash bcrypt
+// cost 10 + soft delete (disabled=1). Timing-attack-resistant via dummy
 // bcrypt.compare untuk user tidak exist.
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body || {};
@@ -1370,18 +1374,19 @@ function setupBotNamespace(app_source) {
         socket.app_source = app_source;
 
         socket.on('bot:register', async (payload) => {
-            // v4.2.0 M6: accept optional rdp_ts_ip + rdp_hostname for mirror hub registry
-            // v4.2.0 M9: accept optional passive_mirror flag — kalau true, clientapp register
-            // untuk mirror listing only (bot engine tidak running). Dispatcher skip emit ke socket ini.
-            // v4.3.0 (2026-11-04): accept optional mirror_enabled flag — clientapp toggle per
-            // akun di dashboard card. Backward compat: payload tanpa field → treat as enabled.
+            // Optional fields from clientapp payload:
+            //   - rdp_ts_ip + rdp_hostname: mirror hub registry coordinates
+            //   - passive_mirror: clientapp registered for mirror-only listing
+            //     (bot engine not running). Dispatcher skip emit ke socket ini.
+            //   - mirror_enabled: per-akun toggle di dashboard card. Backward
+            //     compat: payload tanpa field → treat as enabled.
             const { bot_id, alias, device_id, rdp_ts_ip, rdp_hostname, passive_mirror, mirror_enabled } = payload || {};
             if (!alias) return console.log(`❌ [${app_source}] bot:register missing alias`);
             if (!bot_id) return console.log(`⚠️ [${app_source}] bot:register without bot_id`);
 
-            // v4.5.3 (2026-11-27): revoked RDP gate — reject register + disconnect.
-            // Pairs with POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow).
-            // Fail-open on DB error to preserve availability (log + continue).
+            // Revoked RDP gate — reject register + disconnect. Pairs with
+            // POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow). Fail-open
+            // on DB error to preserve availability (log + continue).
             if (rdp_hostname) {
                 try {
                     const [revRows] = await pool.execute(
@@ -1400,9 +1405,9 @@ function setupBotNamespace(app_source) {
             }
 
             const key = `${app_source}:${alias}`;
-            // v3.8.0 2026-10-29: force-disconnect old socket (defense against legacy
-            // client with 1-global-socket + multi-register pattern). Prevents orphan
-            // entries when a new socket register with same alias while old one still linger.
+            // Force-disconnect old socket (defense against legacy client with
+            // 1-global-socket + multi-register pattern). Prevents orphan entries
+            // when a new socket register with same alias while old one still linger.
             const existingSocket = botSockets.get(key);
             if (existingSocket && existingSocket.id !== socket.id) {
                 try {
@@ -1415,24 +1420,23 @@ function setupBotNamespace(app_source) {
             socket.bot_id = bot_id;
             socket.device_id = device_id;
             socket.alias = alias;
-            // v4.2.0 M6: mirror hub coordinates — store RDP Tailscale IP + hostname
+            // Mirror hub coordinates — store RDP Tailscale IP + hostname.
             socket.rdp_ts_ip = rdp_ts_ip || null;
             socket.rdp_hostname = rdp_hostname || null;
-            // v4.2.0 M9: passive mirror flag — dispatcher skip
+            // Passive mirror flag — dispatcher skip emit ke socket ini.
             socket.passive_mirror = passive_mirror === true;
-            // v4.3.0 (2026-11-04): mirror_enabled flag — controls /api/mirror/devices visibility.
-            // Backward compat: undefined → treat as enabled (allows pre-v4.3.0 bots to keep working).
-            // Clientapp bots v4.3.0+ selalu kirim field explicit (true/false).
+            // mirror_enabled flag — controls /api/mirror/devices visibility.
+            // Backward compat: undefined → treat as enabled (allows older bots
+            // to keep working). Current clientapp bots always send explicit boolean.
             socket.mirror_enabled = (mirror_enabled === undefined) ? true : (mirror_enabled !== false);
             socket.connected_at = new Date().toISOString();
-            // v4.1.3 Fase 1 (2026-11-04): fresh register = clear pending-removal state.
-            // Kalau socket reconnect sebelum 60s grace expire, wipe timestamp supaya tidak
-            // auto-pruned by next tick. emitToBot guard akan allow emit lagi.
+            // Fresh register = clear pending-removal state. Kalau socket reconnect
+            // sebelum 60s grace expire, wipe timestamp supaya tidak auto-pruned
+            // by next tick. emitToBot guard akan allow emit lagi.
             socket.disconnected_at = null;
 
-            // TG Bot Sprint 1 (2026-11-22): auto-register RDP ke rdp_registry.
-            // Model C Auto-Sync + Same-IP Relax (lihat docs/feature_telegram_bot_concept_2026-11-21.md §2).
-            // Post mini-scan G1 (2026-11-22): + security downgrade on diff IP (F1 + F6 race-safe).
+            // Auto-register RDP ke rdp_registry (TG Bot Model C Auto-Sync + Same-IP Relax).
+            // State machine (race-safe INSERT ON DUPLICATE KEY):
             // - First-time hostname: INSERT pending (owner approve via Telegram /approve-rdp)
             // - Pending + sameIp (was bound before): auto-approve (Same-IP Relax)
             // - Approved + sameIp: no change (just update last_ts_ip)
@@ -1465,22 +1469,23 @@ function setupBotNamespace(app_source) {
                             );
                             console.log(`[TG] 🔁 RDP auto-approved via Same-IP Relax: ${rdp_hostname}`);
                         } else if (row.status === 'approved' && row.bound_ts_ip && rdp_ts_ip && !sameIp) {
-                            // F1 Security fix (mini-scan 2026-11-22): approved RDP connecting from different IP
-                            // = possible hostname spoofing. Downgrade to pending, require owner re-approve.
+                            // Security: approved RDP connecting from different IP
+                            // = possible hostname spoofing. Downgrade to pending,
+                            // require owner re-approve.
                             await pool.execute(
                                 `UPDATE rdp_registry SET status = 'pending', last_ts_ip = ? WHERE rdp_hostname = ?`,
                                 [rdp_ts_ip, rdp_hostname]
                             );
                             console.warn(`[TG] ⚠️ RDP IP changed, security downgrade: ${rdp_hostname} (bound ${row.bound_ts_ip} → now ${rdp_ts_ip})`);
                         } else if (row.status === 'approved' && !row.bound_ts_ip && rdp_ts_ip) {
-                            // v4.5.1 fix (2026-11-23): owner-first approve backfill bound_ts_ip.
-                            // If owner approves RDP via /approve_rdp BEFORE any account paired
-                            // (owner-first workflow enabled by v4.5.1 rdp:control_register upsert),
-                            // bound_ts_ip stays NULL — rdp:control_register payload only carries
-                            // rdp_hostname, not rdp_ts_ip. First bot:register post-approve carries
-                            // rdp_ts_ip in handshake payload → backfill here so /list_rdp shows IP
-                            // + Same-IP Relax engages on future reconnects + F1 security downgrade
-                            // works on IP change.
+                            // Owner-first approve backfill bound_ts_ip.
+                            // If owner approves RDP via /approve_rdp BEFORE any
+                            // account paired, bound_ts_ip stays NULL (rdp:control_register
+                            // payload only carries rdp_hostname, not rdp_ts_ip).
+                            // First bot:register post-approve carries rdp_ts_ip in
+                            // handshake payload → backfill here so /list_rdp shows
+                            // IP + Same-IP Relax engages on future reconnects +
+                            // security downgrade works on IP change.
                             await pool.execute(
                                 `UPDATE rdp_registry SET bound_ts_ip = ?, last_ts_ip = ? WHERE rdp_hostname = ?`,
                                 [rdp_ts_ip, rdp_ts_ip, rdp_hostname]
@@ -1512,10 +1517,12 @@ function setupBotNamespace(app_source) {
             console.log(`${socket.passive_mirror ? '📺' : (isReRegister ? '🔁' : '🤖')} [${app_source}] ${regLabel}: ${bot_id} ${alias} (${device_id || '-'})`);
             io.emit('bot:status', { alias, app_source, device_id, online: true, connected_at: socket.connected_at, passive_mirror: socket.passive_mirror });
 
-            // v4.0.0 ACK-P2: backlog dispatch via serial dispatcher (replaces for-loop burst).
-            // On bot reconnect, clear any stale dispatcher state + pull SINGLE next PENDING.
-            // Chain continues on each ACK (freeDispatcherAndPullNext in task:ack handler).
-            // v4.2.0 M9: SKIP backlog dispatch untuk passive_mirror — tidak ada bot engine utk consume task.
+            // Backlog dispatch via serial dispatcher (replaces earlier for-loop
+            // burst). On bot reconnect, clear any stale dispatcher state + pull
+            // SINGLE next PENDING. Chain continues on each ACK
+            // (freeDispatcherAndPullNext in task:ack handler).
+            // SKIP backlog dispatch untuk passive_mirror — tidak ada bot engine
+            // utk consume task.
             if (socket.passive_mirror) {
                 // mirror-only register, abaikan dispatcher sepenuhnya
                 return;
@@ -1542,8 +1549,8 @@ function setupBotNamespace(app_source) {
 
         socket.on('task:ack', async ({ task_id }) => {
             try {
-                // v4.0.1 F4 (2026-11-01): capture affectedRows to gate dispatcher free.
-                // Prevents bogus/spoofed ACK from freeing dispatcher that was legitimately
+                // Capture affectedRows to gate dispatcher free — prevents
+                // bogus/spoofed ACK from freeing dispatcher that was legitimately
                 // busy with other task → re-emit chain gets confused.
                 const [result] = await pool.execute(
                     `UPDATE transfer_request
@@ -1555,10 +1562,10 @@ function setupBotNamespace(app_source) {
                     console.warn(`[${app_source}] [ACK IGNORED] task ${task_id} from ${socket.alias} — no matching PENDING row (spoofed/stale ACK?)`);
                     return;
                 }
-                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id} (at dequeue, v4.0.1)`);
+                console.log(`[${app_source}] [ACK] ${socket.alias} accepted task ${task_id} (at dequeue)`);
                 io.emit('task_ack', { task_id, app_source, alias: socket.alias });
-                // v4.0.0 ACK-P2: free dispatcher slot + pull next PENDING for this alias.
-                // Gated by F4 affectedRows check above.
+                // Free dispatcher slot + pull next PENDING for this alias
+                // (gated by affectedRows check above).
                 await freeDispatcherAndPullNext(app_source, socket.alias);
             } catch (e) {
                 console.error(`[${app_source}] [ACK ERROR] ${task_id}`, e.message);
@@ -1568,31 +1575,31 @@ function setupBotNamespace(app_source) {
         socket.on('bot:unregister', ({ bot_id }) => {
             if (!bot_id || !socket.alias) return;
             const key = `${app_source}:${socket.alias}`;
-            // v3.8.0 2026-10-29: guard — hanya delete kalau socket ini masih socket aktif
-            // untuk key. Prevents accidental delete of newer socket in a force-disconnect
-            // (legacy client with multi-register pattern can trigger unregister dari socket
-            // yang sudah di-superseded).
+            // Guard — hanya delete kalau socket ini masih socket aktif untuk key.
+            // Prevents accidental delete of newer socket in a force-disconnect
+            // (legacy client with multi-register pattern can trigger unregister
+            // dari socket yang sudah di-superseded).
             const current = botSockets.get(key);
             if (current && current.id !== socket.id) {
                 console.log(`[${app_source}] unregister from superseded socket ${socket.id} (${socket.alias}) — skip`);
                 return;
             }
-            // v4.0.1 F2 (2026-11-01): clear dispatcher state so new tasks for this alias
-            // don't silent-block waiting for 60s ACK timeout to recover from stale lock.
+            // Clear dispatcher state so new tasks for this alias don't silent-block
+            // waiting for 60s ACK timeout to recover from stale lock.
             clearDispatcherState(app_source, socket.alias);
             botSockets.delete(key);
             console.log(`👋 [${app_source}] BOT UNREGISTERED: ${bot_id} ${socket.alias}`);
             io.emit('bot:status', { alias: socket.alias, app_source, online: false });
         });
 
-        // Sprint 2e (v4.3.8): control-plane socket registration from clientapp main.js.
+        // Control-plane socket registration from clientapp main.js.
         // Distinct from bot:register — no engine semantics, no bot socket wiring.
-        // Just stashes socket for tg:account_* round-trips.
-        // v4.5.1 fix (2026-11-23): also auto-upsert pending row to rdp_registry.
-        //   Enables owner-first workflow (/approve_rdp BEFORE pairing any accounts).
-        //   No-op if RDP already in registry (preserves status via ON DUPLICATE KEY).
-        //   Mirrors bot:register upsert pattern tanpa rdp_ts_ip (control socket
-        //   payload hanya carry rdp_hostname).
+        // Just stashes socket for tg:account_* round-trips, and auto-upserts
+        // pending row to rdp_registry (enables owner-first workflow:
+        // /approve_rdp BEFORE pairing any accounts). No-op if RDP already in
+        // registry (preserves status via ON DUPLICATE KEY). Mirrors bot:register
+        // upsert pattern tanpa rdp_ts_ip (control socket payload hanya carries
+        // rdp_hostname).
         socket.on('rdp:control_register', async (payload) => {
             const { rdp_hostname } = payload || {};
             if (!rdp_hostname) {
@@ -1601,9 +1608,9 @@ function setupBotNamespace(app_source) {
                 return;
             }
 
-            // v4.5.3 (2026-11-27): revoked RDP gate — reject control register + disconnect.
-            // Pairs with POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow).
-            // Fail-open on DB error to preserve availability (log + continue).
+            // Revoked RDP gate — reject control register + disconnect. Pairs with
+            // POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow). Fail-open on
+            // DB error to preserve availability (log + continue).
             try {
                 const [revRows] = await pool.execute(
                     'SELECT status FROM rdp_registry WHERE rdp_hostname = ? LIMIT 1',
@@ -1632,7 +1639,7 @@ function setupBotNamespace(app_source) {
             rdpControlSockets.set(key, socket);
             console.log(`🎛️ [${app_source}] CONTROL-PLANE REGISTERED: ${rdp_hostname} (socket ${socket.id})`);
 
-            // v4.5.1 fix: upsert pending row (idempotent) — see comment block above.
+            // Upsert pending row (idempotent) — see comment block above.
             try {
                 await pool.execute(
                     `INSERT INTO rdp_registry (rdp_hostname, status) VALUES (?, 'pending')
@@ -1651,42 +1658,42 @@ function setupBotNamespace(app_source) {
             socket.emit('rdp:control_registered', { ok: true, rdp_hostname });
         });
 
-        // Sprint 2e (v4.3.8): ack dispatch for round-trip from telegram-bot-ipc.js /account/*.
+        // ack dispatch for round-trip from telegram-bot-ipc.js /account/*.
         // Clientapp emits this after executing DB CRUD + adb pair with request_id echoed back.
         socket.on('tg:account_ack', (payload) => {
             try { tgIpc.resolveAck(payload); }
             catch (e) { console.error('[tg-ctrl] resolveAck threw:', e.message); }
         });
 
-        // Sprint 2e-3 (v4.3.9): ack dispatch for /api/tg/account/devices (device list query
-        // from /edit device_id picker). Uses the same request_id → pending-map resolver.
+        // ack dispatch for /api/tg/account/devices (device list query from
+        // /edit device_id picker). Uses the same request_id → pending-map resolver.
         socket.on('tg:devices_ack', (payload) => {
             try { tgIpc.resolveAck(payload); }
             catch (e) { console.error('[tg-ctrl] devices_ack resolveAck threw:', e.message); }
         });
 
-        // Sprint 3 (v4.3.10): ack dispatch for fan-out alias lookup (/account/alias_lookup
-        // + /edit + /delete + /bot/start + /bot/stop when rdp_hostname omitted).
+        // ack dispatch for fan-out alias lookup (/account/alias_lookup + /edit
+        // + /delete + /bot/start + /bot/stop when rdp_hostname omitted).
         socket.on('tg:alias_lookup_ack', (payload) => {
             try { tgIpc.resolveAck(payload); }
             catch (e) { console.error('[tg-ctrl] alias_lookup_ack resolveAck threw:', e.message); }
         });
 
-        // Sprint 3 (v4.3.10): ack dispatch for /bot/start + /bot/stop runtime control.
+        // ack dispatch for /bot/start + /bot/stop runtime control.
         socket.on('tg:bot_control_ack', (payload) => {
             try { tgIpc.resolveAck(payload); }
             catch (e) { console.error('[tg-ctrl] bot_control_ack resolveAck threw:', e.message); }
         });
 
-        // Sprint 3 polish (v4.3.14): ack dispatch for /list_accounts fan-out.
+        // ack dispatch for /list_accounts fan-out.
         socket.on('tg:list_accounts_ack', (payload) => {
             try { tgIpc.resolveAck(payload); }
             catch (e) { console.error('[tg-ctrl] list_accounts_ack resolveAck threw:', e.message); }
         });
 
         socket.on('disconnect', async (reason) => {
-            // Sprint 2e (v4.3.8): control-plane socket cleanup. Runs first — control sockets
-            // don't have bot_id so the bot cleanup path below short-circuits for them.
+            // Control-plane socket cleanup. Runs first — control sockets don't
+            // have bot_id so the bot cleanup path below short-circuits for them.
             if (socket.is_control_plane && socket.control_rdp_hostname) {
                 const ctrlKey = `${app_source}:${socket.control_rdp_hostname}`;
                 const current = rdpControlSockets.get(ctrlKey);
@@ -1699,20 +1706,20 @@ function setupBotNamespace(app_source) {
             if (!socket.bot_id) return;
             const key = `${app_source}:${socket.alias}`;
             const alias = socket.alias;
-            // v3.8.0 2026-10-29: same guard — skip kalau socket sudah di-supersede
+            // Same guard — skip kalau socket sudah di-supersede.
             const current = botSockets.get(key);
             if (current && current.id !== socket.id) {
                 console.log(`[${app_source}] disconnect superseded socket ${socket.id} (${alias}) — skip cleanup`);
                 return;
             }
-            // v4.0.1 F2 (2026-11-01): clear dispatcher state. Prevents 60s window where
-            // POST /transfer same alias sees busy dispatcher + silent PENDING queue.
+            // Clear dispatcher state. Prevents 60s window where POST /transfer
+            // same alias sees busy dispatcher + silent PENDING queue.
             clearDispatcherState(app_source, alias);
-            // v4.1.3 Fase 1 (2026-11-04): DELAY delete — set disconnected_at timestamp.
-            // Prune tick (60s interval) akan hapus entry setelah grace > 60000ms. Card
-            // tetap muncul di mirror hub selama grace period, kemudian auto-remove.
-            // bot:unregister handler (L1384) tetap IMMEDIATE delete — user intent eksplisit.
-            // emitToBot L95 guard disconnected_at — task tidak akan di-emit ke dead socket.
+            // DELAY delete — set disconnected_at timestamp. Prune tick (60s
+            // interval) akan hapus entry setelah grace > 60000ms. Card tetap
+            // muncul di mirror hub selama grace period, kemudian auto-remove.
+            // bot:unregister handler tetap IMMEDIATE delete — user intent eksplisit.
+            // emitToBot guard disconnected_at — task tidak di-emit ke dead socket.
             socket.disconnected_at = Date.now();
             console.log(`🟡 [${app_source}] BOT DISCONNECTED: ${socket.bot_id} ${alias} | ${reason} (card kept 60s grace)`);
             io.emit('bot:status', { alias, app_source, online: false });
@@ -1790,14 +1797,11 @@ setInterval(async () => {
             console.log(`♻️ [CLEANUP] Auto-cancelled ${pendingStale.length} stale PENDING task(s) (>${pendingMin} min)`);
         }
 
-        // 3. v3.8.0 2026-10-29: Prune stale botSockets entries (socket disconnected
-        // tapi masih di Map). Target: legacy clients yang unclean crash, atau orphan
-        // dari socket.alias overwrite pattern. Backward-compat untuk bugged clients
-        // yang belum di-refactor ke per-engine socket (brimo <v3.8.0, mybca, seabank).
-        // v4.1.3 Fase 1 (2026-11-04): dual-condition prune.
-        //   1. silentDrop (!sock.connected): socket.io heartbeat detected drop tapi
-        //      disconnect handler tidak fire (legacy clients, orphan dari socket.alias
-        //      overwrite pattern).
+        // 3. Prune stale botSockets entries (socket disconnected tapi masih di
+        // Map). Dual-condition:
+        //   1. silentDrop (!sock.connected): socket.io heartbeat detected drop
+        //      tapi disconnect handler tidak fire (legacy clients, orphan dari
+        //      socket.alias overwrite pattern).
         //   2. graceExpired (disconnected_at > 60s ago): disconnect handler fired,
         //      kartu stayed di mirror hub selama grace period 60s, sekarang auto-remove.
         let prunedCount = 0;
@@ -1827,8 +1831,7 @@ setInterval(async () => {
 }, 60000);
 
 // ==========================================================
-// v4.1.0 (2026-11-01): CALLBACK ADMIN ENDPOINTS
-// Spec: docs/feature-callback-2026-11-01.md §8
+// CALLBACK ADMIN ENDPOINTS
 // Auth: X-Admin-Key header must match env ADMIN_API_KEY.
 // ==========================================================
 app.get('/api/admin/callbacks/stats', requireAdminKey, async (req, res) => {
@@ -1867,7 +1870,7 @@ app.post('/api/admin/callbacks/replay/:task_id', requireAdminKey, async (req, re
 });
 
 // ==========================================================
-// v4.1.5 (2026-11-21): MULTI-USER DASHBOARD AUTH — USER CRUD
+// MULTI-USER DASHBOARD AUTH — USER CRUD
 // ADMIN_API_KEY protected (reuse requireAdminKey middleware).
 // Soft delete pattern (disabled=1), no hard delete (audit trail preserved).
 // ==========================================================
@@ -1958,7 +1961,7 @@ app.delete('/api/admin/users/:id', requireAdminKey, async (req, res) => {
 });
 
 // ==========================================================
-// R5 (2026-10-30): CRASH SAFETY HANDLERS
+// CRASH SAFETY HANDLERS
 // Prevent 1 unhandled async throw / uncaught exception from killing
 // backend when running 30+ bot socket + concurrent transfers.
 // Log + continue (don't exit); monitor logs for recurring patterns.
@@ -1972,8 +1975,8 @@ process.on('uncaughtException', (err) => {
     console.error('💥 [UNCAUGHT EXCEPTION]', err.stack || err);
 });
 
-// v4.1.0 (2026-11-01): graceful shutdown — stop callback worker ticks on SIGTERM/SIGINT.
-// In-flight fetch() allowed to finish (up to CALLBACK_TIMEOUT_MS). PM2 reload = zero lost delivery.
+// Graceful shutdown — stop callback worker ticks on SIGTERM/SIGINT. In-flight
+// fetch() allowed to finish (up to CALLBACK_TIMEOUT_MS). PM2 reload = zero lost delivery.
 process.on('SIGTERM', () => {
     console.log('📴 [SIGTERM] shutdown signal received');
     callbackWorker.shutdown();
@@ -1998,9 +2001,9 @@ server.listen(PORT, () => {
     console.log(`   Legacy unprefixed routes: ${LEGACY_UNPREFIXED ? 'ENABLED' : 'disabled'}`);
     console.log(`   Callback feature: ${ADMIN_API_KEY ? 'ENABLED (admin endpoints LIVE)' : 'core only (ADMIN_API_KEY unset → admin endpoints 503)'}`);
     console.log('==========================================');
-    // F1 (2026-10-29): load auto-approve flag from DB (fire-and-forget, logs own result)
+    // Load auto-approve flag from DB (fire-and-forget, logs own result).
     loadAutoApprovalState();
-    // v4.1.0 (2026-11-01): start callback delivery worker.
+    // Start callback delivery worker.
     callbackWorker.start(pool);
 });
 
@@ -2130,7 +2133,7 @@ function getUnifiedHtmlUI() {
     return HTML_DASHBOARD;
 }
 
-// v2.1.0: Tailscale register form — admin paste auth-id → backend exec `headscale auth register`.
+// Tailscale register form — admin paste auth-id → backend exec `headscale auth register`.
 // Style consistent dgn getLoginUI (same tokens, same dark/light behavior).
 function getTailscaleRegisterUI() {
     return `<!DOCTYPE html>
@@ -2433,7 +2436,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   }
   .icon-btn:hover { color: var(--fg); border-color: var(--border-strong); background: var(--bg-input); }
 
-  /* 2026-10-29 F1: Auto-Approve toggle (amber accent) + warning banner */
+  /* Auto-Approve toggle (amber accent) + warning banner */
   .aa-toggle {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 8px 12px; border-radius: var(--radius-sm);
@@ -2466,7 +2469,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   }
   .aa-warning strong { color: #f59e0b; }
 
-  /* v2.2.0: Tailscale Auto-Accept toggle di header */
+  /* Tailscale Auto-Accept toggle di header */
   .ts-toggle {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 8px 12px; border-radius: var(--radius-sm);
@@ -2494,7 +2497,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     50% { opacity: 0.5; }
   }
 
-  /* v2.2.0: Section Tailscale Pending Register — violet accent untuk distinguish */
+  /* Section Tailscale Pending Register — violet accent untuk distinguish */
   .ts-pending-section { display: none; }
   .ts-pending-section.has-items { display: block; }
   .ts-pending-section .section-header h3 { color: #a855f7; }
@@ -2835,7 +2838,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 2026-10-29 F1: Warning banner saat Auto-Approve ON -->
+    <!-- Warning banner saat Auto-Approve ON -->
     <div class="aa-warning" id="aa-warning" style="display:none">
       ⚠️ <strong>Auto-Approve AKTIF</strong> — SEMUA transaksi (BRImo + myBCA + SeaBank) di-approve otomatis tanpa review admin. Pastikan matikan kembali setelah selesai.
     </div>
@@ -2878,7 +2881,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- v2.2.0: Tailscale Pending Register — muncul saat ada request + auto-accept OFF -->
+    <!-- Tailscale Pending Register — muncul saat ada request + auto-accept OFF -->
     <section class="section ts-pending-section" id="ts-pending-section">
       <div class="section-header">
         <h3>
@@ -3359,9 +3362,9 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     socket.on('new_task', () => { loadQueue(); loadStats(); });
     socket.on('task_ack', () => loadQueue());
     socket.on('bot:status', () => loadBots());
-    // v2.2.0: Tailscale auto-accept + pending register events
+    // Tailscale auto-accept + pending register events
     socket.on('tailscale:auto_accept_state', (data) => renderAutoAcceptToggle(data));
-    // 2026-10-29 F1: cross-session sync untuk Auto-Approve toggle
+    // Cross-session sync untuk Auto-Approve toggle
     socket.on('auto_approve:state', (data) => renderAutoApproveToggle(data.enabled));
     socket.on('tailscale:register_pending', (data) => { addPendingRegister(data); showToast('info', \`🛡️ Tailscale register request masuk\`); });
     socket.on('tailscale:register_completed', (data) => removePendingRegister(data.auth_id));
@@ -3371,7 +3374,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     });
   }
 
-  // ------- v2.2.0: Tailscale Auto-Accept + Pending Register -------
+  // ------- Tailscale Auto-Accept + Pending Register -------
   let autoAcceptCountdownTimer = null;
   const pendingRegisterAuthIds = new Set();
 
@@ -3383,7 +3386,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
     } catch (e) { console.error('loadAutoAcceptStatus', e); }
   }
 
-  // 2026-10-29 F1: Auto-Approve toggle UI (orange/amber accent, persistent — no auto-expiry)
+  // Auto-Approve toggle UI (orange/amber accent, persistent — no auto-expiry)
   async function loadAutoApproveStatus() {
     try {
       const res = await fetch('/api/auto-approve/status');
@@ -3545,7 +3548,7 @@ const HTML_DASHBOARD = `<!DOCTYPE html>
   // ------- Boot -------
   refreshAll();
   loadAutoAcceptStatus();
-  loadAutoApproveStatus();  // 2026-10-29 F1
+  loadAutoApproveStatus();
   setupSocket();
 
   // Session time display

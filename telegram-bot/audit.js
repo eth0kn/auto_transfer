@@ -1,6 +1,6 @@
 // Telegram Bot — Audit Log Helper
-// D3: log ALL commands to tg_audit_log
-// Safe to call from any handler — errors logged, never thrown (fail-open)
+// Log ALL commands to tg_audit_log.
+// Safe to call from any handler — errors logged, never thrown (fail-open).
 
 const { pool } = require('./db');
 
@@ -34,7 +34,7 @@ async function logAudit(params) {
 }
 
 /**
- * v4.5.4 (2026-11-27): purge audit log rows older than N days.
+ * Purge audit log rows older than N days.
  * Called periodically from telegram-bot/index.js retention cron.
  * Fail-open — returns 0 on error (console.error logged).
  * @param {number} days  retention window in days (default 90 if invalid)
