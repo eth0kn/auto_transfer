@@ -31,6 +31,12 @@ const DEFAULT_ROUNDTRIP_MS = parseInt(process.env.TG_ROUNDTRIP_MS || '30000', 10
 let rdpControlSocketsRef = null;
 function setControlSocketMap(map) { rdpControlSocketsRef = map; }
 
+// v4.5.3 (2026-11-27): botSockets Map reference — untuk /api/tg/status aggregate.
+// Injected dari main backend index.js (same pattern as setControlSocketMap).
+// Key format: `${app_source}:${alias}`. Untuk aggregate count per app_source.
+let botSocketsRef = null;
+function setBotSocketMap(map) { botSocketsRef = map; }
+
 /**
  * Scan rdpControlSockets untuk cari ALL active app_sources di hostname tsb.
  * Returns array (0 = no active clientapp, 1 = typical, >1 = multi-app at same RDP rare case).
@@ -313,6 +319,83 @@ async function validateOperatorScope(chatId, rdpHostname) {
 // GET /api/tg/health — liveness check for bot
 router.get('/health', (req, res) => {
     res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+// v4.5.3 (2026-11-27): GET /api/tg/status — aggregate runtime snapshot for /status TG command.
+// Pure backend-side: NO clientapp roundtrip. Data: rdp/operator counts, socket counts, queue depth, today stats.
+// Per-RDP scope-filtered breakdown deferred (requires clientapp inventory query → G8 /health_all).
+router.get('/status', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'db_unavailable' });
+    try {
+        const [rdpCounts] = await pool.execute(
+            `SELECT status, COUNT(*) AS cnt FROM rdp_registry GROUP BY status`
+        );
+        const [operatorCounts] = await pool.execute(
+            `SELECT status, COUNT(*) AS cnt FROM operators GROUP BY status`
+        );
+        const [queueCounts] = await pool.execute(
+            `SELECT app_source, status, COUNT(*) AS cnt FROM transfer_request
+             WHERE status IN ('PENDING','PROCESSING') GROUP BY app_source, status`
+        );
+        const [todayStats] = await pool.execute(
+            `SELECT app_source,
+                    COUNT(*) AS total,
+                    SUM(status = 'SUCCESS') AS success_cnt,
+                    SUM(status = 'FAILED') AS failed_cnt
+             FROM transfer_request
+             WHERE DATE(created_at) = CURDATE()
+             GROUP BY app_source`
+        );
+
+        // Bot sockets online per app_source (iterate injected Map keys)
+        const botsByApp = {};
+        if (botSocketsRef) {
+            for (const key of botSocketsRef.keys()) {
+                const sep = key.indexOf(':');
+                if (sep < 0) continue;
+                const app = key.slice(0, sep);
+                botsByApp[app] = (botsByApp[app] || 0) + 1;
+            }
+        }
+        // Control sockets per app_source (reuse existing injected Map)
+        const controlByApp = {};
+        if (rdpControlSocketsRef) {
+            for (const key of rdpControlSocketsRef.keys()) {
+                const sep = key.indexOf(':');
+                if (sep < 0) continue;
+                const app = key.slice(0, sep);
+                controlByApp[app] = (controlByApp[app] || 0) + 1;
+            }
+        }
+
+        res.json({
+            ok: true,
+            rdps_by_status: Object.fromEntries(rdpCounts.map(r => [r.status, Number(r.cnt)])),
+            operators_by_status: Object.fromEntries(operatorCounts.map(o => [o.status, Number(o.cnt)])),
+            bots_online_by_app: botsByApp,
+            control_sockets_by_app: controlByApp,
+            queue_by_app: queueCounts.reduce((acc, r) => {
+                acc[r.app_source] = acc[r.app_source] || {};
+                acc[r.app_source][r.status] = Number(r.cnt);
+                return acc;
+            }, {}),
+            today_by_app: todayStats.reduce((acc, r) => {
+                const total = Number(r.total);
+                const success = Number(r.success_cnt);
+                acc[r.app_source] = {
+                    total,
+                    success,
+                    failed: Number(r.failed_cnt),
+                    success_rate_pct: total > 0 ? Math.round((success / total) * 100) : 0,
+                };
+                return acc;
+            }, {}),
+            ts: new Date().toISOString(),
+        });
+    } catch (e) {
+        console.error('[tg-ipc /status]', e.message);
+        res.status(500).json({ error: 'internal', detail: e.message });
+    }
 });
 
 // ==========================================================
@@ -726,6 +809,48 @@ router.get('/account/devices', async (req, res) => {
     return res.json({ ok: true, devices });
 });
 
+// v4.5.3 (2026-11-27): POST /api/tg/rdp/revoke_kick
+// Force-disconnect all bot sockets + control sockets attached to a revoked RDP.
+// Called by owner.js handleRevokeRdp AFTER DB UPDATE status='revoked'.
+// Clientapp socket.io default reconnect → backend rejects at register gate (revoked).
+// Returns count disconnected per bucket.
+router.post('/rdp/revoke_kick', async (req, res) => {
+    const { hostname } = req.body || {};
+    if (!hostname) return res.status(400).json({ error: 'missing_fields', detail: 'required: hostname' });
+
+    let botDisconnected = 0;
+    let controlDisconnected = 0;
+
+    // Bot sockets — key: `${app_source}:${alias}`, socket has rdp_hostname stored at register time
+    if (botSocketsRef) {
+        for (const sock of botSocketsRef.values()) {
+            if (sock.rdp_hostname === hostname) {
+                try {
+                    sock.disconnect(true);
+                    botDisconnected++;
+                } catch (_) { /* already dead */ }
+            }
+        }
+    }
+
+    // Control sockets — key: `${app_source}:${rdp_hostname}` — straight-match on map key suffix
+    if (rdpControlSocketsRef) {
+        for (const [key, sock] of rdpControlSocketsRef.entries()) {
+            const sep = key.indexOf(':');
+            if (sep < 0) continue;
+            if (key.slice(sep + 1) === hostname) {
+                try {
+                    sock.disconnect(true);
+                    controlDisconnected++;
+                } catch (_) { /* already dead */ }
+            }
+        }
+    }
+
+    console.log(`[tg-ipc /rdp/revoke_kick] hostname=${hostname} bot=${botDisconnected} control=${controlDisconnected}`);
+    return res.json({ ok: true, hostname, bot_disconnected: botDisconnected, control_disconnected: controlDisconnected });
+});
+
 // GET /api/tg/accounts/list?operator_chat_id=X
 // Sprint 3 polish (v4.3.14): fan-out list of all accounts across operator's
 // scope. Returns groups-by-RDP structure + totals summary.
@@ -739,4 +864,4 @@ router.get('/accounts/list', async (req, res) => {
     return res.json({ ok: true, ...result });
 });
 
-module.exports = { router, setDb, setEmitter, setControlSocketMap, resolveAck };
+module.exports = { router, setDb, setEmitter, setControlSocketMap, setBotSocketMap, resolveAck };

@@ -4,6 +4,10 @@
 const { pool } = require('../db');
 const { logAudit } = require('../audit');
 const { escapeHtml } = require('../util');
+// v4.5.3 (2026-11-27): /shadow persistence via app_config DB table
+const { shadowState, updateShadowState } = require('../shadow');
+// v4.5.3 (2026-11-27): /revoke_rdp runtime kick via /api/tg/rdp/revoke_kick
+const { postJson } = require('../backend-client');
 
 // ==========================================================
 // RDP Management
@@ -101,7 +105,23 @@ async function handleRevokeRdp(ctx) {
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_rdp', args: hostname, result: 'error', error_message: 'not_found_or_already_revoked' });
             return;
         }
-        await ctx.reply(`🚫 RDP <code>${escapeHtml(hostname)}</code> revoked.\n\n<i>Note: Sprint 1 only marks DB — kick+stop enforcement Sprint 3.</i>`, { parse_mode: 'HTML' });
+        // v4.5.3 (2026-11-27): kick existing sockets via /api/tg/rdp/revoke_kick.
+        // Backend force-disconnects bot + control sockets. Register gate at bot:register
+        // + rdp:control_register prevents re-register. Clientapp loop reconnect → rejected.
+        let kickDetail = '';
+        try {
+            const kickResp = await postJson('/rdp/revoke_kick', { hostname });
+            if (kickResp.ok) {
+                const bot = kickResp.data?.bot_disconnected ?? 0;
+                const ctl = kickResp.data?.control_disconnected ?? 0;
+                kickDetail = `\n<i>Runtime kick: ${bot} bot socket + ${ctl} control socket disconnected. Re-register blocked (revoke gate).</i>`;
+            } else {
+                kickDetail = `\n<i>⚠️ Runtime kick gagal (HTTP ${kickResp.status}) — DB status sudah revoked. Jalankan pm2 reload unified-backend kalau socket masih aktif.</i>`;
+            }
+        } catch (e) {
+            kickDetail = `\n<i>⚠️ Runtime kick error: ${escapeHtml(e.message)}</i>`;
+        }
+        await ctx.reply(`🚫 RDP <code>${escapeHtml(hostname)}</code> revoked.${kickDetail}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_rdp', args: hostname, result: 'success' });
     } catch (e) {
         console.error('[handler /revoke_rdp]', e.message);
@@ -203,9 +223,13 @@ async function handleRevokeOperator(ctx) {
             await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'error', error_message: 'not_found' });
             return;
         }
-        // F3 mini-scan Sprint 2a fix: cascade cleanup wizard state for revoked operator
+        // v4.3.x (F3 mini-scan fix): cascade cleanup wizard state for revoked operator
         await pool.execute(`DELETE FROM wizard_sessions WHERE chat_id = ?`, [chatId]);
-        await ctx.reply(`🚫 Operator <code>${escapeHtml(chatId)}</code> revoked.\n\n<i>D5: Sprint 3 will enforce kick + stop running bots. Sprint 1 only marks DB.</i>`, { parse_mode: 'HTML' });
+        // v4.5.3 (2026-11-27): text accuracy — middleware fresh-queries operators table
+        // per request (strict status='approved' filter, zero cache). Revoked operator
+        // role resolves to 'unknown' on NEXT TG action → any destructive command denied.
+        // Bots are per-account (not per-operator), so no "stop bots" semantic applies.
+        await ctx.reply(`🚫 Operator <code>${escapeHtml(chatId)}</code> revoked.\n\n<i>Wizard sessions cleaned. Next command from this chat_id akan ditolak (role → unknown).</i>`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/revoke_operator', args: chatId, result: 'success' });
     } catch (e) {
         console.error('[handler /revoke_operator]', e.message);
@@ -255,46 +279,50 @@ async function handleShadow(ctx) {
     const text = ctx.message?.text || '';
     const parts = text.trim().split(/\s+/);
 
+    // v4.5.3 (2026-11-27): /shadow toggle now PERSISTS via app_config DB.
+    // Loaded di boot via initShadowState (telegram-bot/index.js). Toggle di sini
+    // mutasi shadowState in-memory + write ke DB (reuse auto_approve_enabled pattern).
     if (parts.length < 2) {
-        const current = {
-            enabled: process.env.TG_SHADOW_ENABLED || 'true',
-            filter: process.env.TG_SHADOW_FILTER || 'all'
-        };
         await ctx.reply(
             `👁 <b>Shadow Observability</b>\n\n` +
-            `Current: enabled=${escapeHtml(current.enabled)}, filter=${escapeHtml(current.filter)}\n\n` +
+            `Current: enabled=<b>${shadowState.enabled ? 'ON' : 'OFF'}</b>, filter=<code>${escapeHtml(shadowState.filter)}</code>\n\n` +
             `Usage:\n` +
             `• <code>/shadow on</code> / <code>/shadow off</code>\n` +
-            `• <code>/shadow filter all|destructive|errors</code>\n\n` +
-            `<i>Note: Sprint 1 — env vars set at bot start. Runtime toggle: Sprint 2+ persistent store.</i>`,
+            `• <code>/shadow filter all|destructive|errors|off</code>\n\n` +
+            `<i>Persisted via app_config DB — survives pm2 reload/restart.</i>`,
             { parse_mode: 'HTML' }
         );
         return;
     }
 
     const action = parts[1].toLowerCase();
-    // Sprint 1: in-memory runtime override (resets on restart)
-    if (action === 'on') {
-        process.env.TG_SHADOW_ENABLED = 'true';
-        await ctx.reply(`✅ Shadow forwarding: ON (runtime only — persist via .env)`);
-    } else if (action === 'off') {
-        process.env.TG_SHADOW_ENABLED = 'false';
-        await ctx.reply(`🔇 Shadow forwarding: OFF (runtime only — persist via .env)`);
-    } else if (action === 'filter') {
-        const level = parts[2]?.toLowerCase();
-        if (!['all', 'destructive', 'errors'].includes(level)) {
-            await ctx.reply(`❌ Invalid filter. Use: <code>all</code>, <code>destructive</code>, or <code>errors</code>`, { parse_mode: 'HTML' });
-            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'invalid_filter' });
+    try {
+        if (action === 'on') {
+            await updateShadowState(pool, 'enabled', true);
+            await ctx.reply(`✅ Shadow forwarding: <b>ON</b> (persisted)`, { parse_mode: 'HTML' });
+        } else if (action === 'off') {
+            await updateShadowState(pool, 'enabled', false);
+            await ctx.reply(`🔇 Shadow forwarding: <b>OFF</b> (persisted)`, { parse_mode: 'HTML' });
+        } else if (action === 'filter') {
+            const level = parts[2]?.toLowerCase();
+            if (!['all', 'destructive', 'errors', 'off'].includes(level)) {
+                await ctx.reply(`❌ Invalid filter. Use: <code>all</code>, <code>destructive</code>, <code>errors</code>, atau <code>off</code>`, { parse_mode: 'HTML' });
+                await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'invalid_filter' });
+                return;
+            }
+            await updateShadowState(pool, 'filter', level);
+            await ctx.reply(`✅ Shadow filter: <code>${escapeHtml(level)}</code> (persisted)`, { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply(`❌ Unknown action. Use: <code>/shadow on|off|filter &lt;level&gt;</code>`, { parse_mode: 'HTML' });
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'unknown_action' });
             return;
         }
-        process.env.TG_SHADOW_FILTER = level;
-        await ctx.reply(`✅ Shadow filter: <code>${escapeHtml(level)}</code> (runtime only)`, { parse_mode: 'HTML' });
-    } else {
-        await ctx.reply(`❌ Unknown action. Use: <code>/shadow on|off|filter &lt;level&gt;</code>`, { parse_mode: 'HTML' });
-        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'rejected', error_message: 'unknown_action' });
-        return;
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'success' });
+    } catch (e) {
+        console.error('[handler /shadow] persistence failed:', e.message);
+        await ctx.reply(`❌ Error persisting shadow state: ${escapeHtml(e.message)}`, { parse_mode: 'HTML' });
+        await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'error', error_message: e.message });
     }
-    await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/shadow', args: parts.slice(1).join(' '), result: 'success' });
 }
 
 async function handleAudit(ctx) {

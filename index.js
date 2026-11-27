@@ -1053,6 +1053,8 @@ app.get('/api/bots', requireAuth, (req, res) => {
 const tgIpc = require('./telegram-bot-ipc');
 tgIpc.setDb(pool);
 tgIpc.setControlSocketMap(rdpControlSockets);
+// v4.5.3 (2026-11-27): inject botSockets Map untuk GET /api/tg/status aggregate.
+tgIpc.setBotSocketMap(botSockets);
 tgIpc.setEmitter((app_source, rdp_hostname, event, payload) => {
     const key = `${app_source}:${rdp_hostname}`;
     const sock = rdpControlSockets.get(key);
@@ -1377,6 +1379,26 @@ function setupBotNamespace(app_source) {
             if (!alias) return console.log(`❌ [${app_source}] bot:register missing alias`);
             if (!bot_id) return console.log(`⚠️ [${app_source}] bot:register without bot_id`);
 
+            // v4.5.3 (2026-11-27): revoked RDP gate — reject register + disconnect.
+            // Pairs with POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow).
+            // Fail-open on DB error to preserve availability (log + continue).
+            if (rdp_hostname) {
+                try {
+                    const [revRows] = await pool.execute(
+                        'SELECT status FROM rdp_registry WHERE rdp_hostname = ? LIMIT 1',
+                        [rdp_hostname]
+                    );
+                    if (revRows[0]?.status === 'revoked') {
+                        console.log(`🚫 [${app_source}] bot:register rejected — RDP '${rdp_hostname}' is revoked`);
+                        try { socket.emit('rdp:revoked', { rdp_hostname }); } catch (_) {}
+                        socket.disconnect(true);
+                        return;
+                    }
+                } catch (e) {
+                    console.error(`[${app_source}] bot:register revoke-check error (fail-open):`, e.message);
+                }
+            }
+
             const key = `${app_source}:${alias}`;
             // v3.8.0 2026-10-29: force-disconnect old socket (defense against legacy
             // client with 1-global-socket + multi-register pattern). Prevents orphan
@@ -1578,6 +1600,25 @@ function setupBotNamespace(app_source) {
                 socket.emit('rdp:control_registered', { ok: false, error: 'missing_rdp_hostname' });
                 return;
             }
+
+            // v4.5.3 (2026-11-27): revoked RDP gate — reject control register + disconnect.
+            // Pairs with POST /api/tg/rdp/revoke_kick (owner /revoke_rdp flow).
+            // Fail-open on DB error to preserve availability (log + continue).
+            try {
+                const [revRows] = await pool.execute(
+                    'SELECT status FROM rdp_registry WHERE rdp_hostname = ? LIMIT 1',
+                    [rdp_hostname]
+                );
+                if (revRows[0]?.status === 'revoked') {
+                    console.log(`🚫 [${app_source}] rdp:control_register rejected — RDP '${rdp_hostname}' is revoked`);
+                    socket.emit('rdp:control_registered', { ok: false, error: 'rdp_revoked' });
+                    socket.disconnect(true);
+                    return;
+                }
+            } catch (e) {
+                console.error(`[${app_source}] rdp:control_register revoke-check error (fail-open):`, e.message);
+            }
+
             const key = `${app_source}:${rdp_hostname}`;
             const existing = rdpControlSockets.get(key);
             if (existing && existing.id !== socket.id) {

@@ -12,6 +12,64 @@ const { escapeHtml } = require('./util');
 const COOLDOWN_MS = parseInt(process.env.TG_SHADOW_COOLDOWN_MS || '2000', 10);
 const operatorRateState = new Map(); // chat_id → { lastSentAt, droppedCount, firstDropAt }
 
+// v4.5.3 (2026-11-27): shadow runtime state — persisted via app_config DB table.
+// Loaded at bot boot via initShadowState(pool). Mutated by /shadow TG command
+// (owner.js handleShadow) + persisted back via updateShadowState(pool, key, val).
+// Fallback to env vars for first-boot migration period (kalau DB rows belum ada).
+const shadowState = {
+    enabled: (process.env.TG_SHADOW_ENABLED || 'true') === 'true',
+    filter:  process.env.TG_SHADOW_FILTER  || 'all',
+    initialized: false, // flag — true after initShadowState() berhasil
+};
+
+/**
+ * Load shadow state dari DB app_config table.
+ * Fallback ke env defaults kalau row belum ada (migration period).
+ * Harus dipanggil sekali di startup (telegram-bot/index.js) setelah DB connect.
+ */
+async function initShadowState(pool) {
+    try {
+        const [rows] = await pool.execute(
+            "SELECT `key`, `value` FROM app_config WHERE `key` IN ('shadow_enabled','shadow_filter')"
+        );
+        for (const r of rows) {
+            if (r.key === 'shadow_enabled') shadowState.enabled = (r.value === 'true');
+            if (r.key === 'shadow_filter')  shadowState.filter  = r.value;
+        }
+        shadowState.initialized = true;
+        console.log(`✅ [shadow] state loaded from app_config — enabled=${shadowState.enabled}, filter=${shadowState.filter}`);
+    } catch (e) {
+        console.warn(`⚠️ [shadow] initShadowState failed (fallback to env defaults): ${e.message}`);
+        // state keeps env-derived defaults — shadowState.initialized remains false
+    }
+}
+
+/**
+ * Persist + mutate 1 shadow setting. Called by owner.js handleShadow.
+ * @param {object} pool MySQL pool
+ * @param {'enabled'|'filter'} key
+ * @param {string|boolean} value — for 'enabled': true/false; for 'filter': 'all'|'destructive'|'errors'|'off'
+ * @returns {Promise<void>}
+ */
+async function updateShadowState(pool, key, value) {
+    let dbKey, dbValue;
+    if (key === 'enabled') {
+        dbKey = 'shadow_enabled';
+        dbValue = (value === true || value === 'true') ? 'true' : 'false';
+        shadowState.enabled = (dbValue === 'true');
+    } else if (key === 'filter') {
+        dbKey = 'shadow_filter';
+        dbValue = String(value);
+        shadowState.filter = dbValue;
+    } else {
+        throw new Error(`updateShadowState: unknown key '${key}' (expected 'enabled' or 'filter')`);
+    }
+    await pool.execute(
+        "INSERT INTO app_config (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+        [dbKey, dbValue]
+    );
+}
+
 // Periodic purge of idle state (every 60s, drop entries idle > 5 min with no pending drops)
 const PURGE_INTERVAL_MS = 60 * 1000;
 const PURGE_IDLE_MS = 5 * 60 * 1000;
@@ -62,11 +120,9 @@ function shouldForward(eventType, filter) {
  * @param {'success'|'error'|'denied'|'destructive'} [params.eventType='success']
  */
 async function forwardToOwner({ ctx, operatorChatId, operatorLabel, cmd, result, eventType = 'success' }) {
-    const enabled = (process.env.TG_SHADOW_ENABLED || 'true') === 'true';
-    if (!enabled) return;
-
-    const filter = process.env.TG_SHADOW_FILTER || 'all';
-    if (!shouldForward(eventType, filter)) return;
+    // v4.5.3: read from in-memory shadowState (persisted via app_config, loaded at boot).
+    if (!shadowState.enabled) return;
+    if (!shouldForward(eventType, shadowState.filter)) return;
 
     const ownerChatId = process.env.OWNER_CHAT_ID;
     if (!ownerChatId) return;
@@ -156,4 +212,13 @@ async function notifyOwnerUnknown(ctx, cmd) {
     }
 }
 
-module.exports = { forwardToOwner, notifyOwnerDenied, notifyOwnerUnknown, nowWIB };
+module.exports = {
+    forwardToOwner,
+    notifyOwnerDenied,
+    notifyOwnerUnknown,
+    nowWIB,
+    // v4.5.3: persistence API
+    shadowState,          // live object — read .enabled / .filter
+    initShadowState,      // call at bot startup (telegram-bot/index.js)
+    updateShadowState,    // call from owner.js handleShadow to toggle+persist
+};

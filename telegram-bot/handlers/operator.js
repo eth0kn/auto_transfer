@@ -201,7 +201,8 @@ function nextAddStep(currentKey) {
 
 async function handleList(ctx) {
     const r = ctx.state.role;
-    // Sprint 1: simplified stub — just confirm command received + list operator scope
+    // v4.3.x: lists approved RDPs (overview). Detailed account inventory per
+    // RDP tersedia via /list_accounts (v4.3.14+ — aggregated multi-RDP view).
     let scope;
     if (r.role === 'owner') {
         scope = 'ALL (owner — no RDP restriction)';
@@ -220,7 +221,7 @@ async function handleList(ctx) {
         } else {
             const lines = rdps.map(x => `• <code>${escapeHtml(x.rdp_hostname)}</code> — ${escapeHtml(x.last_ts_ip || '-')} (last seen ${escapeHtml(x.last_seen_at)})`);
             await ctx.reply(
-                `📋 <b>Approved RDPs</b>\n\nScope: ${escapeHtml(scope)}\n\n${lines.join('\n')}\n\n<i>Account listing per RDP: coming Sprint 2.</i>`,
+                `📋 <b>Approved RDPs</b>\n\nScope: ${escapeHtml(scope)}\n\n${lines.join('\n')}\n\n<i>💡 Pakai <code>/list_accounts</code> untuk lihat detail akun per RDP (device, saldo minimal, flags).</i>`,
                 { parse_mode: 'HTML' }
             );
         }
@@ -244,41 +245,72 @@ async function handleList(ctx) {
 
 async function handleStatus(ctx) {
     const r = ctx.state.role;
+    // v4.5.3 (2026-11-27): /status aggregate snapshot via /api/tg/status endpoint.
+    // Data: RDP+operator counts, bot+control socket counts per app_source, queue
+    // depth, today's stats. Per-RDP scope-filtered breakdown deferred (G8 /health_all).
     try {
-        const [rdps] = await pool.execute(
-            `SELECT status, COUNT(*) as cnt FROM rdp_registry GROUP BY status`
-        );
-        const [ops] = await pool.execute(
-            `SELECT status, COUNT(*) as cnt FROM operators GROUP BY status`
-        );
+        const resp = await getJson('/status');
+        if (!resp.ok) {
+            await ctx.reply(`❌ Status endpoint error: ${escapeHtml(resp.data?.detail || `HTTP ${resp.status}`)}`, { parse_mode: 'HTML' });
+            await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/status', result: 'error', error_message: `http_${resp.status}` });
+            return;
+        }
+        const s = resp.data;
 
-        const rdpSummary = rdps.map(x => `${x.status}: ${x.cnt}`).join(', ') || 'none';
-        const opSummary = ops.map(o => `${o.status}: ${o.cnt}`).join(', ') || 'none';
+        const fmt = (obj) => Object.keys(obj).length === 0 ? '<i>none</i>' : Object.entries(obj).map(([k, v]) => `${escapeHtml(k)}: <b>${v}</b>`).join(', ');
+        const APP_ICONS = { brimo: '🟢', mybca: '🔵', seabank: '🟠' };
+
+        const appLines = [];
+        const apps = new Set([
+            ...Object.keys(s.bots_online_by_app || {}),
+            ...Object.keys(s.control_sockets_by_app || {}),
+            ...Object.keys(s.queue_by_app || {}),
+            ...Object.keys(s.today_by_app || {}),
+        ]);
+        for (const app of apps) {
+            const bots    = s.bots_online_by_app?.[app] || 0;
+            const control = s.control_sockets_by_app?.[app] || 0;
+            const queue   = s.queue_by_app?.[app] || {};
+            const today   = s.today_by_app?.[app] || { total: 0, success: 0, success_rate_pct: 0 };
+            const icon = APP_ICONS[app] || '⚪';
+            appLines.push(
+                `${icon} <b>${escapeHtml(app)}</b> — bot sockets: <b>${bots}</b>, control: <b>${control}</b>`,
+                `   queue: PENDING=${queue.PENDING || 0}, PROCESSING=${queue.PROCESSING || 0}`,
+                `   today: ${today.total} tx (${today.success} ok, success ${today.success_rate_pct}%)`
+            );
+        }
+        if (appLines.length === 0) appLines.push('<i>no clientapp data</i>');
 
         const text = [
-            `📊 <b>System Status</b>`,
+            `📊 <b>System Status</b> <i>(aggregate)</i>`,
             ``,
-            `<b>RDPs</b>: ${escapeHtml(rdpSummary)}`,
-            `<b>Operators</b>: ${escapeHtml(opSummary)}`,
+            `<b>RDPs</b>: ${fmt(s.rdps_by_status || {})}`,
+            `<b>Operators</b>: ${fmt(s.operators_by_status || {})}`,
             ``,
-            `<i>Bot runtime status (Sprint 3): coming soon.</i>`
+            `<b>Per-clientapp:</b>`,
+            ...appLines,
+            ``,
+            `<i>⏱ ${escapeHtml(s.ts || '?')}</i>`,
+            `<i>💡 Detail per-RDP (device, saldo): <code>/list_accounts</code></i>`,
         ].join('\n');
 
         await ctx.reply(text, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/status', result: 'success' });
 
         if (r.role === 'operator') {
+            const rdpSummary = Object.entries(s.rdps_by_status || {}).map(([k, v]) => `${k}:${v}`).join(',');
+            const opSummary = Object.entries(s.operators_by_status || {}).map(([k, v]) => `${k}:${v}`).join(',');
             await forwardToOwner({
                 ctx,
                 operatorChatId: r.chat_id,
                 operatorLabel: r.operator?.display_name || 'operator',
                 cmd: '/status',
-                result: `Fetched status: RDPs ${rdpSummary}, Ops ${opSummary}`
+                result: `Fetched status: RDPs ${rdpSummary || 'none'}, Ops ${opSummary || 'none'}`
             });
         }
     } catch (e) {
         console.error('[handler /status]', e.message);
-        await ctx.reply(`❌ Error: ${e.message}`);
+        await ctx.reply(`❌ Error: ${escapeHtml(e.message)}`, { parse_mode: 'HTML' });
         await logAudit({ chat_id: r.chat_id, role: r.role, cmd: '/status', result: 'error', error_message: e.message });
     }
 }
@@ -398,11 +430,6 @@ async function handleDeleteConfirm(ctx) {
     if (resp.ok) {
         replyText = `✅ Delete request accepted.\n<code>${escapeHtml(pending.alias)}@${escapeHtml(pending.rdp_hostname)}</code>`;
         auditResult = 'success';
-    } else if (resp.status === 501) {
-        // Sprint 2b scaffold — backend accepts auth+scope but clientapp not wired yet
-        replyText = `⚠️ <b>Scaffold accepted</b>\n\nBackend auth+scope OK.\nClientapp support coming Sprint 2e.\n\n<i>Status 501: ${escapeHtml(resp.data?.detail || 'not implemented')}</i>`;
-        auditResult = 'success';
-        auditErrMsg = 'sprint2b_scaffold_queued';
     } else if (resp.status === 403) {
         replyText = `❌ Scope denied: ${escapeHtml(resp.data?.detail || 'unknown')}`;
         auditResult = 'denied';
@@ -952,10 +979,6 @@ async function handleEditConfirm(ctx) {
     if (resp.ok) {
         replyText = `✅ Edit applied.\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code> · ${escapeHtml(field)}=<code>${escapeHtml(displayValue)}</code>`;
         auditResult = 'success';
-    } else if (resp.status === 501) {
-        replyText = `⚠️ <b>Scaffold accepted</b>\n\nBackend auth+scope+field OK.\nClientapp support coming Sprint 2e.\n\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code> · ${escapeHtml(field)}=<code>${escapeHtml(displayValue)}</code>\n\n<i>Status 501: ${escapeHtml(resp.data?.detail || 'not implemented')}</i>`;
-        auditResult = 'success';
-        auditErrMsg = 'sprint2c_scaffold_queued';
     } else if (resp.status === 403) {
         replyText = `❌ Scope denied: ${escapeHtml(resp.data?.detail || 'unknown')}`;
         auditResult = 'denied';
@@ -1240,10 +1263,6 @@ async function handleAddConfirm(ctx) {
     if (resp.ok) {
         replyText = `✅ Account created.\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code>`;
         auditResult = 'success';
-    } else if (resp.status === 501) {
-        replyText = `⚠️ <b>Scaffold accepted</b>\n\nBackend auth+scope+validation OK.\nClientapp support coming Sprint 2e.\n\n<code>${escapeHtml(alias)}@${escapeHtml(rdp_hostname)}</code>\n\n<i>Status 501: ${escapeHtml(resp.data?.detail || 'not implemented')}</i>`;
-        auditResult = 'success';
-        auditErrMsg = 'sprint2d1_scaffold_queued';
     } else if (resp.status === 403) {
         replyText = `❌ Scope denied: ${escapeHtml(resp.data?.detail || 'unknown')}`;
         auditResult = 'denied';

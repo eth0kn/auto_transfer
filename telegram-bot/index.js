@@ -16,6 +16,8 @@ const { Telegraf } = require('telegraf');
 const { roleMiddleware } = require('./middleware');
 const { registerHandlers } = require('./handlers');
 const { pool } = require('./db');
+// v4.5.3 (2026-11-27): shadow state persistence via app_config
+const { initShadowState, shadowState } = require('./shadow');
 
 // ==========================================================
 // Config Validation (fail-fast)
@@ -103,11 +105,14 @@ async function healthCheck() {
 (async () => {
     await healthCheck();
 
+    // v4.5.3: load shadow state dari app_config (fallback env kalau row belum ada)
+    await initShadowState(pool);
+
     // Log BEFORE bot.launch() because launch() long-polling never resolves
     console.log(`✅ [BOT] Telegram bot starting — long-polling mode`);
     console.log(`   Owner chat_id: ${OWNER}`);
-    console.log(`   Shadow enabled: ${process.env.TG_SHADOW_ENABLED || 'true'}`);
-    console.log(`   Shadow filter: ${process.env.TG_SHADOW_FILTER || 'all'}`);
+    console.log(`   Shadow enabled: ${shadowState.enabled}`);
+    console.log(`   Shadow filter: ${shadowState.filter}`);
 
     // Publish command list BEFORE launch — Telegram picks this up in <5s
     // for autocomplete in all chats. Non-blocking: launch continues even if
